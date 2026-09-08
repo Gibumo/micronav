@@ -16,15 +16,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Paquetes de CRAN que no vienen en rocker/verse.
-# El chequeo final (installed.packages) hace que el "docker build" FALLE si
-# algún paquete no se instaló -- sin esto, install.packages() puede fallar
-# en silencio y el error solo aparece horas después, al correr el render.
+# Reintenta hasta 3 veces los paquetes que falten (los tropiezos de red/mirror
+# de CRAN durante el build, como con la dependencia 'Deriv', suelen ser
+# momentáneos y se resuelven solos en un segundo intento). Si después de 3
+# intentos algo sigue faltando, el "docker build" falla con la lista exacta.
 RUN R -e " \
       pkgs <- c('vegan', 'ggpubr', 'mvabund', 'openxlsx', 'readxl', 'tableone', \
                 'matrixStats', 'cowplot', 'patchwork', 'randomForest', 'caret', \
                 'pROC', 'car', 'rstatix', 'FSA', 'ggtext', 'data.table'); \
-      install.packages(pkgs, repos = 'https://cloud.r-project.org', \
-                        Ncpus = parallel::detectCores()); \
+      for (i in 1:3) { \
+        falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
+        if (length(falta) == 0) break; \
+        message('Intento ', i, ' -- instalando: ', paste(falta, collapse = ', ')); \
+        install.packages(falta, repos = 'https://cloud.r-project.org', \
+                          Ncpus = parallel::detectCores()); \
+      }; \
       falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
       if (length(falta) > 0) stop('No se instalaron: ', paste(falta, collapse = ', ')) \
     "
