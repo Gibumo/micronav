@@ -15,12 +15,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     awscli \
     && rm -rf /var/lib/apt/lists/*
 
-# Paquetes de CRAN que no vienen en rocker/verse
-RUN R -e "install.packages(c( \
-      'vegan', 'ggpubr', 'mvabund', 'openxlsx', 'readxl', 'tableone', \
-      'matrixStats', 'cowplot', 'patchwork', 'randomForest', 'caret', \
-      'pROC', 'car', 'rstatix', 'FSA', 'ggtext', 'data.table' \
-    ), repos = 'https://cloud.r-project.org', Ncpus = parallel::detectCores())"
+# Paquetes de CRAN que no vienen en rocker/verse.
+# El chequeo final (installed.packages) hace que el "docker build" FALLE si
+# algún paquete no se instaló -- sin esto, install.packages() puede fallar
+# en silencio y el error solo aparece horas después, al correr el render.
+RUN R -e " \
+      pkgs <- c('vegan', 'ggpubr', 'mvabund', 'openxlsx', 'readxl', 'tableone', \
+                'matrixStats', 'cowplot', 'patchwork', 'randomForest', 'caret', \
+                'pROC', 'car', 'rstatix', 'FSA', 'ggtext', 'data.table'); \
+      install.packages(pkgs, repos = 'https://cloud.r-project.org', \
+                        Ncpus = parallel::detectCores()); \
+      falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
+      if (length(falta) > 0) stop('No se instalaron: ', paste(falta, collapse = ', ')) \
+    "
 
 # Re-instala xfun/knitr/rmarkdown/evaluate JUNTOS al final, para que queden
 # en versiones mutuamente compatibles. Sin esto, instalar los paquetes de
