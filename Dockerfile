@@ -19,8 +19,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN R -e "install.packages(c( \
       'vegan', 'ggpubr', 'mvabund', 'openxlsx', 'readxl', 'tableone', \
       'matrixStats', 'cowplot', 'patchwork', 'randomForest', 'caret', \
-      'pROC', 'car', 'rstatix', 'FSA', 'ggtext' \
+      'pROC', 'car', 'rstatix', 'FSA', 'ggtext', 'data.table' \
     ), repos = 'https://cloud.r-project.org', Ncpus = parallel::detectCores())"
+
+# Re-instala xfun/knitr/rmarkdown/evaluate JUNTOS al final, para que queden
+# en versiones mutuamente compatibles. Sin esto, instalar los paquetes de
+# arriba puede actualizar una dependencia de knitr sin tocar xfun y produce
+# el error "object 'attr' is not exported by 'namespace:xfun'" al renderizar.
+RUN R -e "install.packages(c('xfun', 'knitr', 'rmarkdown', 'evaluate'), \
+      repos = 'https://cloud.r-project.org')"
 
 WORKDIR /analysis
 

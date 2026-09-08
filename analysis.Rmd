@@ -111,7 +111,7 @@ data_dir <- Sys.getenv(
 
 path_shared   <- file.path(data_dir, "microvap_colombia_mothur.shared")
 path_taxonomy <- file.path(data_dir, "microvap_colombia_mothur.cons.taxonomy")
-path_metadata <- file.path(data_dir, "microvap_colombia_mothur.metadata_completa.xlsx")
+path_metadata <- file.path(data_dir, "microvap_colombia_mothur.metadata_completa.txt")
 
 otu_raw <- read.table(path_shared, header = TRUE, stringsAsFactors = FALSE)
 rownames(otu_raw) <- otu_raw[, 2]
@@ -176,7 +176,8 @@ print(paste("Taxonomy:", nrow(otu_good_taxonomy), "OTUs annotated"))
 
 ```{r metadata}
 
-meta_df <- read_excel(path_metadata) %>%
+meta_df <- data.table::fread(path_metadata) %>%
+  as.data.frame() %>%
   filter(specimen %in% rownames(otu_good))
 
 print(paste("Clinical samples with sequencing data:", nrow(meta_df)))
