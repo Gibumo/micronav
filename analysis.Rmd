@@ -1,0 +1,1163 @@
+---
+title: "Respiratory Microbiota Across NP, ETA, and BAL Samples: Baseline vs 72h Follow-up"
+subtitle: "Analysis pipeline for AJRCCM Research Letter (Blue-202605-1069RL)"
+author: "Gisell Bustos Moya | Dickson Lab / Universidad de La Sabana"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+    keep_tex: false
+  html_document:
+    code_folding: show
+    df_print: paged
+    toc: true
+    toc_float:
+      collapsed: false
+    smooth_scroll: false
+---
+
+## 1. Overview
+
+This script analyzes respiratory microbiota (16S rRNA gene sequencing) across three
+anatomical compartments — nasopharyngeal (NP), endotracheal aspirate (ETA), and
+bronchoalveolar lavage (BAL) — sampled at baseline and 72-hour follow-up in
+mechanically ventilated ICU patients (n = 141; sequencing runs R231, R572, R575).
+
+Sections:
+
+- Data loading, taxonomy annotation, and quality filtering (sections 4–5)
+- Beta diversity: PCoA and PERMANOVA (section 6)
+- Alpha diversity: Shannon index (section 7)
+- Relative abundance and differential abundance testing (sections 8–9)
+- Random Forest classification (section 10)
+- Multivariate modeling with `mvabund` (section 11)
+- Summary of statistical methods and multiple-comparison corrections (section 12)
+
+---
+
+```{r clear_environment}
+rm(list = ls(all = TRUE))
+```
+
+## 2. Setup
+
+```{r setup, include=FALSE}
+
+# Output directory for all figures and tables.
+# Locally (Windows/RStudio): falls back to the original OneDrive path if
+# OUTPUT_DIR is not set. In Docker: set OUTPUT_DIR=/analysis/output (mounted
+# volume) so results land somewhere the host / S3 upload step can reach.
+output_dir <- Sys.getenv(
+  "OUTPUT_DIR",
+  "C:/Users/ingridbumo/OneDrive - Universidad de la Sabana/Escritorio/Documentos Organizados/TSID-CCM/RStudio Estadistica/Comparison samples/figures_comparison_samples_final"
+)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 7,
+  fig.height = 5,
+  fig.path   = paste0(output_dir, "/"),
+  dev        = "png"
+)
+
+```
+
+## 3. Libraries
+
+```{r libraries, message=FALSE}
+
+library(tidyverse)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(scales)
+library(mvabund)
+library(openxlsx)
+library(readxl)
+library(tableone)
+library(knitr)
+library(matrixStats)
+library(cowplot)
+library(patchwork)
+library(randomForest)
+library(caret)
+library(pROC)
+library(car)
+library(rstatix)
+library(FSA)
+library(ggtext)   # required for italicized genus labels in Fig. 4 and Fig. 5
+
+```
+
+## 4. Data Loading
+
+<!-- Adjust file paths below to match your local environment. -->
+
+### 4.1 OTU Table
+
+```{r import_otu}
+
+# Local (Windows/RStudio): falls back to the original OneDrive path.
+# Docker: set DATA_DIR=/analysis/data (mounted volume with the 3 input files).
+data_dir <- Sys.getenv(
+  "DATA_DIR",
+  "C:/Users/ingridbumo/OneDrive - Universidad de la Sabana/1 - Equipo/Descargas/dickson"
+)
+
+path_shared   <- file.path(data_dir, "microvap_colombia_mothur.shared")
+path_taxonomy <- file.path(data_dir, "microvap_colombia_mothur.cons.taxonomy")
+path_metadata <- file.path(data_dir, "microvap_colombia_mothur.metadata_completa.xlsx")
+
+otu_raw <- read.table(path_shared, header = TRUE, stringsAsFactors = FALSE)
+rownames(otu_raw) <- otu_raw[, 2]
+otu_trim <- as.matrix(otu_raw[, -c(1:3)])
+
+# Retain only OTUs with relative abundance > 0.1% across the dataset, to
+# reduce noise from rare/spurious taxa while preserving biologically
+# relevant variation.
+otu_tmp  <- decostand(otu_trim, method = "total") * 100
+otu_trim[otu_tmp < 0.1] <- 0
+otu_good <- otu_trim[, colSums(otu_trim) > 0]
+
+rownames(otu_good) <- rownames(otu_trim) %>%
+  str_remove("_S\\d+_.*") %>%
+  str_replace_all("[_X]+", "_") %>%
+  str_remove("_$")
+
+print(paste("OTU table:", nrow(otu_good), "samples x", ncol(otu_good), "OTUs"))
+print(paste("Sequencing runs:", paste(unique(str_extract(rownames(otu_good), "^R\\d+")), collapse = ", ")))
+```
+
+### 4.2 Taxonomy
+
+```{r import_taxonomy}
+tax1 <- read.table(path_taxonomy,
+                   sep = "\t", row.names = 1, header = TRUE,
+                   colClasses = c("character", "numeric", "character"))
+
+tax2 <- read.table(path_taxonomy,
+                   sep = ";", skip = 1,
+                   col.names = c("", "Phylum", "Class", "Order", "Family", "Genus", ""),
+                   stringsAsFactors = FALSE) %>%
+  select(-c(1, 7)) %>%
+  map_df(~ str_replace(., "\\(.*\\)", "")) %>%
+  map_df(as.factor)
+
+otu_taxonomy <- data.frame(OTU  = rownames(tax1),
+                           Size = tax1[, 1],
+                           tax2,
+                           stringsAsFactors = FALSE)
+rownames(otu_taxonomy) <- rownames(tax1)
+
+otu_good_taxonomy <- otu_taxonomy[otu_taxonomy$OTU %in% colnames(otu_good), ] %>%
+  droplevels()
+rownames(otu_good_taxonomy) <- intersect(rownames(otu_taxonomy), colnames(otu_good))
+
+# OTU -> Genus lookup, used throughout for figure labels and taxon-level tests
+genus_lookup <- setNames(as.character(otu_good_taxonomy$Genus), otu_good_taxonomy$OTU)
+otu_ids <- names(genus_lookup)
+
+# Strip "unclassified" prefix/suffix (Mothur convention, e.g. "Family_unclassified")
+# so figure labels show clean genus names.
+genus_lookup <- gsub("(?i)^unclassified[_ ]*", "", genus_lookup, perl = TRUE)
+genus_lookup <- gsub("(?i)[_ ]*unclassified$", "", genus_lookup, perl = TRUE)
+genus_lookup <- trimws(genus_lookup)
+names(genus_lookup) <- otu_ids
+
+print(paste("Taxonomy:", nrow(otu_good_taxonomy), "OTUs annotated"))
+```
+
+### 4.3 Metadata
+
+```{r metadata}
+
+meta_df <- read_excel(path_metadata) %>%
+  filter(specimen %in% rownames(otu_good))
+
+print(paste("Clinical samples with sequencing data:", nrow(meta_df)))
+print(paste("Specimens in otu_good:", nrow(otu_good)))
+print(paste("Matched:", sum(meta_df$specimen %in% rownames(otu_good))))
+print(table(str_extract(meta_df$specimen, "^R\\d+")))
+
+otu_aligned <- decostand(otu_good[meta_df$specimen, ], method = "total") * 100
+otu_df      <- bind_cols(meta_df, as.data.frame(otu_aligned))
+
+print(paste("otu_df:", nrow(otu_df), "rows x", ncol(otu_df), "columns"))
+
+```
+
+### 4.4 Combined dataset (baseline + follow-up, NP/ETA/BAL)
+
+```{r combined_df_all}
+
+combined_df_all <- otu_df %>%
+  filter(timepoint_character %in% c("baseline", "follow_dos")) %>%
+  mutate(
+    tissue_type = case_when(
+      tissue_type == "nasal" ~ "NP",
+      tissue_type == "ts"    ~ "ETA",
+      tissue_type == "bal"   ~ "BAL",
+      TRUE ~ tissue_type
+    ),
+    tissue_type = factor(tissue_type, levels = c("NP", "ETA", "BAL")),
+    timepoint_character = factor(timepoint_character, levels = c("baseline", "follow_dos"))
+  ) %>%
+  filter(specimen %in% rownames(otu_good)) %>%
+  droplevels()
+
+# Check for duplicate specimen IDs before proceeding
+dup_specimens <- combined_df_all$specimen[duplicated(combined_df_all$specimen)]
+if (length(dup_specimens) > 0) {
+  cat("WARNING:", length(dup_specimens), "duplicated specimen ID(s) in combined_df_all:\n")
+  print(dup_specimens)
+  print(combined_df_all %>% filter(specimen %in% dup_specimens) %>%
+          select(specimen, tissue_type, timepoint_character))
+}
+
+print(paste("combined_df_all (before depth filtering):", nrow(combined_df_all), "samples"))
+
+```
+
+### 4.5 Sequencing depth filtering
+
+Samples with fewer than 1,000 total reads after quality filtering, chimera removal,
+and lineage-based contaminant removal (Mothur pipeline) are excluded, as read counts
+at this level are not reliably distinguishable from background/negative-control
+signal and can distort diversity estimates.
+
+```{r depth_filtering}
+
+MIN_DEPTH <- 1000
+
+combined_df_all <- combined_df_all %>%
+  mutate(seq_depth = rowSums(otu_good[specimen, ]))
+
+low_depth_samples <- combined_df_all %>%
+  filter(seq_depth < MIN_DEPTH) %>%
+  select(specimen, tissue_type, timepoint_character, seq_depth)
+
+cat("Samples excluded for sequencing depth <", MIN_DEPTH, "reads:", nrow(low_depth_samples), "\n")
+print(low_depth_samples)
+
+combined_df_all <- combined_df_all %>%
+  filter(seq_depth >= MIN_DEPTH) %>%
+  select(-seq_depth) %>%
+  droplevels()
+
+print(paste("combined_df_all (after depth filtering):", nrow(combined_df_all), "samples"))
+print(table(combined_df_all$tissue_type, combined_df_all$timepoint_character))
+
+```
+
+### 4.6 Color Palettes
+
+```{r palettes}
+tissue_colors    <- c("NP" = "indianred3", "ETA" = "cyan3", "BAL" = "plum3")
+timepoint_colors <- c("baseline" = "goldenrod2", "follow_dos" = "steelblue3")
+pcapal_new       <- colorRampPalette(brewer.pal(9, "Set1"))(15)
+```
+
+---
+
+## 5. Clinical Descriptive Analysis
+
+### 5.1 Admission Diagnoses
+
+```{r admission_diagnosis_plot}
+filtered_data <- otu_df %>%
+  filter(timepoint_character == "baseline",
+         tissue_type %in% c("nasal", "ts", "bal")) %>%
+  select(patient_id, admission_infectious, admission_general_surgery,
+         admission_cardiovascular, admission_trauma, admission_nephrological,
+         admission_neurological, admission_neurosurgical, admission_autoimmune,
+         admission_toxic, admission_metabolic, other_diagnostic_admission) %>%
+  distinct(patient_id, .keep_all = TRUE)
+
+long_data <- filtered_data %>%
+  pivot_longer(cols = -patient_id,
+               names_to  = "Diagnosis_Category",
+               values_to = "Presence") %>%
+  filter(Presence == 1)
+
+diagnosis_counts <- long_data %>%
+  group_by(Diagnosis_Category) %>%
+  summarise(Num_Cases = n(), .groups = "drop") %>%
+  arrange(desc(Num_Cases))
+
+labels_dict <- c(
+  "admission_infectious"      = "Infectious (Non-Pulmonary)",
+  "admission_general_surgery" = "General Surgery",
+  "admission_cardiovascular"  = "Cardiovascular Condition",
+  "admission_trauma"          = "Traumatic Injury",
+  "admission_nephrological"   = "Kidney Dysfunction/Failure",
+  "admission_neurological"    = "Neurological Disorder",
+  "admission_neurosurgical"   = "Neurosurgery",
+  "admission_autoimmune"      = "Autoimmune Disease",
+  "admission_toxic"           = "Toxic Exposure",
+  "admission_metabolic"       = "Metabolic Disorder",
+  "other_diagnostic_admission"= "Other Diagnosis"
+)
+
+diagnosis_counts$Diagnosis_Category <- labels_dict[diagnosis_counts$Diagnosis_Category]
+
+ggplot(diagnosis_counts,
+       aes(x = Num_Cases, y = reorder(Diagnosis_Category, Num_Cases))) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "black", alpha = 0.8) +
+  scale_x_continuous(breaks = seq(0, max(diagnosis_counts$Num_Cases), by = 5)) +
+  labs(title = "Admission Diagnosis Categories (Baseline, Unique Patients)",
+       x = "Number of Patients", y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y  = element_text(size = 11, face = "bold"),
+        axis.text.x  = element_text(size = 10),
+        plot.title   = element_text(size = 13, face = "bold", hjust = 0.5))
+```
+
+---
+
+## 6. Beta Diversity — PCoA and PERMANOVA
+
+### 6.1 Global PCoA (all samples, baseline + follow-up)
+
+```{r beta_diversity_pcoa_all}
+
+otu_matrix_all   <- otu_good[combined_df_all$specimen, , drop = FALSE]
+otu_dist_bray_all <- vegdist(otu_matrix_all, method = "bray")
+
+otu_pcoa_all <- cmdscale(otu_dist_bray_all, eig = TRUE,
+                         k = min(ncol(otu_matrix_all) - 1, nrow(otu_matrix_all) - 1))
+
+eigenvalues <- otu_pcoa_all$eig
+total_positive_eigenvalues <- sum(eigenvalues[eigenvalues > 0])
+percent_explained <- eigenvalues[eigenvalues > 0] / total_positive_eigenvalues * 100
+
+pcoa_df_all <- as.data.frame(otu_pcoa_all$points)[, 1:2]
+colnames(pcoa_df_all) <- c("PCoA1", "PCoA2")
+pcoa_df_all$TissueType <- combined_df_all$tissue_type
+pcoa_df_all$Timepoint  <- combined_df_all$timepoint_character
+
+stopifnot(!any(is.na(pcoa_df_all)))
+
+ggplot(pcoa_df_all, aes(x = PCoA1, y = PCoA2, color = TissueType, shape = Timepoint)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = tissue_colors) +
+  scale_shape_manual(values = c("baseline" = 16, "follow_dos" = 17)) +
+  labs(title = "PCoA of Microbiota Using Bray-Curtis Distance",
+       x = paste0("PCoA1 (", round(percent_explained[1], 2), "%)"),
+       y = paste0("PCoA2 (", round(percent_explained[2], 2), "%)"),
+       color = "Tissue Type", shape = "Timepoint") +
+  theme_minimal()
+
+# Global PERMANOVA by anatomical site (all samples)
+permanova_site <- adonis2(formula = otu_dist_bray_all ~ tissue_type,
+                          data = combined_df_all, permutations = 999, method = "bray")
+print(permanova_site)
+
+```
+
+### 6.2 PERMANOVA — NP vs ETA vs BAL, within each timepoint
+
+```{r permanova_by_timepoint}
+
+# Baseline
+samples_df_baseline <- combined_df_all %>% filter(timepoint_character == "baseline") %>% droplevels()
+otu_matrix_baseline  <- otu_good[samples_df_baseline$specimen, , drop = FALSE]
+set.seed(9999)
+bray_curtis_dist_baseline <- vegdist(otu_matrix_baseline, method = "bray")
+permanova_baseline <- adonis2(bray_curtis_dist_baseline ~ tissue_type,
+                              data = samples_df_baseline, permutations = 9999)
+print(permanova_baseline)
+
+# Follow-up
+samples_df_follow <- combined_df_all %>% filter(timepoint_character == "follow_dos") %>% droplevels()
+otu_matrix_follow  <- otu_good[samples_df_follow$specimen, , drop = FALSE]
+set.seed(9999)
+bray_curtis_dist_follow <- vegdist(otu_matrix_follow, method = "bray")
+permanova_follow <- adonis2(bray_curtis_dist_follow ~ tissue_type,
+                            data = samples_df_follow, permutations = 9999)
+print(permanova_follow)
+
+```
+
+### 6.3 PERMANOVA — Longitudinal within each tissue (baseline vs follow-up)
+
+```{r permanova_longitudinal_by_tissue}
+
+run_perm_longitudinal <- function(site) {
+  df_site <- combined_df_all %>% filter(tissue_type == site) %>% droplevels()
+  mat     <- otu_good[df_site$specimen, , drop = FALSE]
+  set.seed(9999)
+  dist_bc <- vegdist(mat, method = "bray")
+  adonis2(dist_bc ~ timepoint_character, data = df_site, permutations = 999, method = "bray")
+}
+
+perm_np  <- run_perm_longitudinal("NP")
+perm_eta <- run_perm_longitudinal("ETA")
+perm_bal <- run_perm_longitudinal("BAL")
+
+print(perm_np)
+print(perm_eta)
+print(perm_bal)
+
+```
+
+### 6.4 Figure 2 — Beta Diversity (5-panel: cross-sectional + longitudinal)
+
+```{r figure2_helper}
+
+format_p_beta <- function(adonis_result) {
+  p <- adonis_result$`Pr(>F)`[1]
+  if (p < 0.01) "p < 0.01" else if (p < 0.05) "p < 0.05" else "p > 0.05"
+}
+
+# Combines a box+PCoA+box panel with a bordered label row (panel title + p-value).
+# main_plot is wrapped with wrap_elements() before combining with the label row,
+# and the combined result is wrapped again before the border theme is applied,
+# so patchwork treats each panel as a single atomic unit (needed for correct
+# tag_levels="A" labeling and to avoid the border being drawn twice).
+add_label_and_border <- function(main_plot, panel_title, p_label) {
+  label_row <- ggplot() +
+    annotate("text", x = 0, y = 0.75, label = panel_title, fontface = "bold", size = 5.5, hjust = 0) +
+    annotate("text", x = 0, y = 0.2,  label = p_label, size = 4, hjust = 0) +
+    xlim(0, 1) + ylim(0, 1.3) +
+    theme_void()
+
+  combined <- (wrap_elements(main_plot) / label_row) + plot_layout(heights = c(4, 0.6))
+  outer <- wrap_elements(combined)
+  outer + theme(plot.background = element_rect(color = "black", fill = NA, linewidth = 1.1),
+                plot.margin = ggplot2::margin(4, 4, 4, 4))
+}
+
+```
+
+```{r figure2_panelAB_by_tissue, fig.width=9, fig.height=6}
+
+build_panel_by_tissue <- function(timepoint_filter, panel_title, permanova_result) {
+  df <- pcoa_df_all %>%
+    filter(Timepoint == timepoint_filter) %>%
+    mutate(TissueType = factor(TissueType, levels = c("NP", "ETA", "BAL")))
+
+  gg_pcoa <- ggplot(df, aes(x = PCoA1, y = PCoA2)) +
+    geom_point(aes(color = TissueType, shape = TissueType), size = 1) +
+    stat_ellipse(aes(color = TissueType, fill = TissueType), geom = "polygon",
+                 alpha = 0.1, level = 0.95, linewidth = 0.8) +
+    scale_color_manual(values = tissue_colors) +
+    scale_fill_manual(values = tissue_colors, guide = "none") +
+    scale_shape_manual(values = c("NP" = 16, "ETA" = 17, "BAL" = 15)) +
+    theme_minimal() +
+    labs(x = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)"),
+         y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)"),
+         color = "Tissue Type", shape = "Tissue Type") +
+    theme(legend.position = "right", plot.margin = ggplot2::margin(b = 12, r = 4))
+
+  pc1_box <- ggplot(df, aes(x = TissueType, y = PCoA1, fill = TissueType)) +
+    geom_boxplot(outlier.shape = 19, alpha = 0.6) +
+    scale_fill_manual(values = tissue_colors) +
+    theme_minimal() +
+    labs(x = NULL, y = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)")) +
+    theme(legend.position = "none", plot.margin = ggplot2::margin(t = 12, r = 4))
+
+  pc2_box <- ggplot(df, aes(x = TissueType, y = PCoA2, fill = TissueType)) +
+    geom_boxplot(outlier.shape = 19, alpha = 0.6) +
+    scale_fill_manual(values = tissue_colors) +
+    theme_minimal() +
+    labs(x = NULL, y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)")) +
+    theme(legend.position = "none")
+
+  main <- (pc2_box + gg_pcoa) / (plot_spacer() + pc1_box) + plot_layout(heights = c(2, 1))
+  add_label_and_border(main, panel_title, format_p_beta(permanova_result))
+}
+
+panel_A <- build_panel_by_tissue("baseline",   "Baseline",   permanova_baseline)
+panel_B <- build_panel_by_tissue("follow_dos", "Follow-up",  permanova_follow)
+
+print(panel_A)
+print(panel_B)
+
+```
+
+```{r figure2_panelCDE_longitudinal, fig.width=9, fig.height=6}
+
+build_panel_longitudinal <- function(site, follow_color, panel_title, permanova_result) {
+  df <- pcoa_df_all %>%
+    filter(TissueType == site) %>%
+    mutate(Timepoint_label = case_when(
+      Timepoint == "baseline"   ~ "Baseline",
+      Timepoint == "follow_dos" ~ "Follow-up"
+    ),
+    Timepoint_label = factor(Timepoint_label, levels = c("Baseline", "Follow-up")))
+
+  cols <- c("Baseline" = "goldenrod2", "Follow-up" = follow_color)
+
+  gg_pcoa <- ggplot(df, aes(x = PCoA1, y = PCoA2, color = Timepoint_label, shape = Timepoint_label)) +
+    stat_ellipse(aes(fill = Timepoint_label), geom = "polygon", alpha = 0.2, level = 0.95, linewidth = 1) +
+    geom_point(size = 2) +
+    scale_color_manual(values = cols) +
+    scale_fill_manual(values = cols, guide = "none") +
+    scale_shape_manual(values = c("Baseline" = 16, "Follow-up" = 17)) +
+    theme_minimal() +
+    labs(x = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)"),
+         y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)"),
+         color = "Timepoint", shape = "Timepoint") +
+    theme(legend.position = "right", plot.margin = ggplot2::margin(b = 12, r = 4))
+
+  pc1_box <- ggplot(df, aes(x = Timepoint_label, y = PCoA1, fill = Timepoint_label)) +
+    geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+    scale_fill_manual(values = cols) +
+    theme_minimal() +
+    labs(x = NULL, y = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)")) +
+    theme(legend.position = "none", plot.margin = ggplot2::margin(t = 12, r = 4))
+
+  pc2_box <- ggplot(df, aes(x = Timepoint_label, y = PCoA2, fill = Timepoint_label)) +
+    geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+    scale_fill_manual(values = cols) +
+    theme_minimal() +
+    labs(x = NULL, y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)")) +
+    theme(legend.position = "none")
+
+  main <- (pc2_box + gg_pcoa) / (plot_spacer() + pc1_box) + plot_layout(heights = c(2, 1))
+  add_label_and_border(main, panel_title, format_p_beta(permanova_result))
+}
+
+panel_C <- build_panel_longitudinal("NP",  "indianred3", "NP",  perm_np)
+panel_D <- build_panel_longitudinal("ETA", "cyan3",      "ETA", perm_eta)
+panel_E <- build_panel_longitudinal("BAL", "plum3",      "BAL", perm_bal)
+
+print(panel_C)
+print(panel_D)
+print(panel_E)
+
+```
+
+```{r figure2_combined, fig.width=22, fig.height=11}
+
+fig2_top    <- panel_A | panel_B
+fig2_bottom <- panel_C | panel_D | panel_E
+
+fig2_final <- fig2_top / fig2_bottom +
+  plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(size = 22, face = "bold"),
+        plot.tag.position = c(0, 1),
+        plot.margin = ggplot2::margin(t = 18, r = 10, b = 8, l = 10))
+
+print(fig2_final)
+
+ggsave(file.path(output_dir, "Figure2_BetaDiversity_Combined.tiff"), plot = fig2_final,
+       width = 22, height = 11, dpi = 600, compression = "lzw")
+
+```
+
+---
+
+## 7. Alpha Diversity — Shannon Index
+
+### 7.1 Baseline: NP vs ETA vs BAL
+
+```{r alpha_diversity_baseline}
+
+div_df_baseline <- combined_df_all %>% filter(timepoint_character == "baseline") %>% droplevels()
+otu_mat_b <- as.matrix(otu_good[div_df_baseline$specimen, , drop = FALSE])
+mode(otu_mat_b) <- "numeric"; otu_mat_b[is.na(otu_mat_b)] <- 0
+
+shan_df <- div_df_baseline %>%
+  mutate(Shannon = diversity(otu_mat_b, index = "shannon"),
+         Richness = specnumber(otu_mat_b))
+
+kw_b <- kruskal.test(Shannon ~ tissue_type, data = shan_df)
+print(kw_b)
+```
+
+### 7.2 Follow-up: NP vs ETA vs BAL
+
+```{r alpha_diversity_follow}
+
+div_df_follow <- combined_df_all %>% filter(timepoint_character == "follow_dos") %>% droplevels()
+otu_mat_f <- as.matrix(otu_good[div_df_follow$specimen, , drop = FALSE])
+mode(otu_mat_f) <- "numeric"; otu_mat_f[is.na(otu_mat_f)] <- 0
+
+shan_df_f <- div_df_follow %>%
+  mutate(Shannon = diversity(otu_mat_f, index = "shannon"),
+         Richness = specnumber(otu_mat_f))
+
+kw_f <- kruskal.test(Shannon ~ tissue_type, data = shan_df_f)
+print(kw_f)
+```
+
+### 7.3 Longitudinal Alpha Diversity: NP, ETA, BAL
+
+```{r alpha_diversity_longitudinal}
+
+calc_shannon <- function(df_site) {
+  mat <- as.matrix(otu_good[df_site$specimen, , drop = FALSE])
+  mode(mat) <- "numeric"; mat[is.na(mat)] <- 0
+  df_site %>% mutate(Shannon = diversity(mat, index = "shannon"))
+}
+
+shan_NP_all  <- combined_df_all %>% filter(tissue_type == "NP")  %>% calc_shannon()
+shan_ETA_all <- combined_df_all %>% filter(tissue_type == "ETA") %>% calc_shannon()
+shan_BAL_all <- combined_df_all %>% filter(tissue_type == "BAL") %>% calc_shannon()
+
+cat("NP, baseline vs follow-up\n")
+print(kruskal.test(Shannon ~ timepoint_character, data = shan_NP_all))
+print(wilcox.test(Shannon ~ timepoint_character, data = shan_NP_all))
+
+cat("ETA, baseline vs follow-up\n")
+print(kruskal.test(Shannon ~ timepoint_character, data = shan_ETA_all))
+print(wilcox.test(Shannon ~ timepoint_character, data = shan_ETA_all))
+
+cat("BAL, baseline vs follow-up\n")
+print(kruskal.test(Shannon ~ timepoint_character, data = shan_BAL_all))
+print(wilcox.test(Shannon ~ timepoint_character, data = shan_BAL_all))
+
+```
+
+### 7.4 Figure 3 — Alpha Diversity (5-panel: cross-sectional + longitudinal)
+
+```{r figure3_panelAB_by_tissue, fig.width=6, fig.height=5}
+
+build_violin_by_tissue <- function(df, panel_title) {
+  ggplot(df, aes(x = tissue_type, y = Shannon, fill = tissue_type)) +
+    geom_violin(alpha = 0.5, color = "black") +
+    geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, color = "black") +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "black") +
+    stat_compare_means(comparisons = list(c("NP", "ETA"), c("NP", "BAL"), c("ETA", "BAL")),
+                       method = "wilcox.test", p.adjust.method = "bonferroni",
+                       label = "p.signif", size = 4, tip.length = 0.02) +
+    scale_fill_manual(values = tissue_colors) +
+    labs(title = panel_title, y = "Shannon Index", x = NULL) +
+    theme_bw() +
+    theme(legend.position = "none", panel.grid = element_blank(),
+          axis.text.x = element_text(size = 11, face = "bold"),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+panel3_A <- build_violin_by_tissue(shan_df,   "Baseline")
+panel3_B <- build_violin_by_tissue(shan_df_f, "Follow-up")
+
+print(panel3_A)
+print(panel3_B)
+
+```
+
+```{r figure3_panelCDE_longitudinal, fig.width=5, fig.height=5}
+
+format_p_label <- function(p) {
+  if (p < 0.01) "p < 0.01" else if (p < 0.05) "p < 0.05" else "p > 0.05"
+}
+
+build_violin_longitudinal <- function(df_site, site_label, follow_color) {
+
+  p_val <- wilcox.test(Shannon ~ timepoint_character, data = df_site)$p.value
+  p_lab <- format_p_label(p_val)
+
+  df_plot <- df_site %>%
+    mutate(Timepoint_label = case_when(
+      timepoint_character == "baseline"   ~ "Baseline",
+      timepoint_character == "follow_dos" ~ "Follow-up"
+    ),
+    Timepoint_label = factor(Timepoint_label, levels = c("Baseline", "Follow-up")))
+
+  cols_label <- c("Baseline" = "goldenrod2", "Follow-up" = follow_color)
+
+  ggplot(df_plot, aes(x = Timepoint_label, y = Shannon, fill = Timepoint_label)) +
+    geom_violin(alpha = 0.5, color = "black") +
+    geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, color = "black") +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "black") +
+    scale_fill_manual(values = cols_label) +
+    labs(title = site_label, y = "Shannon Diversity Index", x = "Timepoint") +
+    annotate("text", x = 1.5, y = min(df_plot$Shannon, na.rm = TRUE) - 0.15,
+             label = p_lab, size = 4, hjust = 0.5) +
+    theme_bw() +
+    theme(legend.position = "none", panel.grid = element_blank(),
+          axis.text.x = element_text(size = 11, face = "bold"),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+panel3_C <- build_violin_longitudinal(shan_NP_all,  "NP",  "indianred3")
+panel3_D <- build_violin_longitudinal(shan_ETA_all, "ETA", "cyan3")
+panel3_E <- build_violin_longitudinal(shan_BAL_all, "BAL", "plum3")
+
+print(panel3_C)
+print(panel3_D)
+print(panel3_E)
+
+```
+
+```{r figure3_combined, fig.width=14, fig.height=10}
+
+fig3_top    <- panel3_A | panel3_B
+fig3_bottom <- panel3_C | panel3_D | panel3_E
+
+fig3_final <- fig3_top / fig3_bottom +
+  plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(tag_levels = "A")
+
+print(fig3_final)
+
+ggsave(file.path(output_dir, "Figure3_AlphaDiversity_Combined.tiff"), plot = fig3_final,
+       width = 14, height = 10, dpi = 600, compression = "lzw")
+
+cat("Pairwise Wilcoxon, Baseline (Bonferroni, n=3 comparisons)\n")
+print(pairwise.wilcox.test(shan_df$Shannon, shan_df$tissue_type, p.adjust.method = "bonferroni"))
+
+cat("Pairwise Wilcoxon, Follow-up (Bonferroni, n=3 comparisons)\n")
+print(pairwise.wilcox.test(shan_df_f$Shannon, shan_df_f$tissue_type, p.adjust.method = "bonferroni"))
+
+```
+
+---
+
+## 8. Relative Abundance — Longitudinal (baseline vs follow-up), per tissue, top-20 OTUs
+
+<!-- Wilcoxon rank-sum per OTU, Benjamini-Hochberg correction; test family =
+     top-20 most abundant OTUs, determined independently within each tissue
+     (NP, ETA, BAL). -->
+
+```{r relative_abundance_longitudinal_function}
+
+run_top20_longitudinal <- function(site, fill_colors = c("baseline" = "lightsalmon2", "follow_dos" = "deepskyblue3")) {
+
+  df_site <- combined_df_all %>% filter(tissue_type == site) %>% droplevels()
+  mat     <- otu_good[df_site$specimen, , drop = FALSE]
+  rel     <- sweep(mat, 1, rowSums(mat), "/") * 100
+
+  long_df <- rel %>%
+    as.data.frame() %>%
+    mutate(specimen = rownames(rel)) %>%
+    pivot_longer(-specimen, names_to = "OTU", values_to = "Abundance") %>%
+    left_join(df_site[, c("specimen", "timepoint_character")], by = "specimen")
+
+  summary_df <- long_df %>%
+    group_by(timepoint_character, OTU) %>%
+    summarize(Mean_Abundance = mean(Abundance, na.rm = TRUE),
+              SEM_Abundance  = sd(Abundance, na.rm = TRUE) / sqrt(n()), .groups = "drop")
+
+  top20 <- summary_df %>%
+    group_by(OTU) %>%
+    summarise(Total_Abundance = sum(Mean_Abundance)) %>%
+    arrange(desc(Total_Abundance)) %>%
+    slice_head(n = 20) %>%
+    pull(OTU)
+
+  filtered_df <- summary_df %>%
+    filter(OTU %in% top20) %>%
+    mutate(OTU = factor(OTU, levels = sort(top20)))
+
+  wilcox_results <- long_df %>%
+    filter(OTU %in% top20) %>%
+    group_by(OTU) %>%
+    summarise(p_value = wilcox.test(Abundance ~ timepoint_character)$p.value, .groups = "drop") %>%
+    mutate(p_adj = p.adjust(p_value, method = "BH"),
+           Genus  = genus_lookup[OTU])
+
+  filtered_df <- filtered_df %>%
+    left_join(wilcox_results, by = "OTU") %>%
+    mutate(Signif = case_when(p_adj < 0.001 ~ "***", p_adj < 0.01 ~ "**", p_adj < 0.05 ~ "*", TRUE ~ ""))
+
+  list(top20 = top20, filtered_df = filtered_df, wilcox_results = wilcox_results, site = site)
+}
+
+res_NP  <- run_top20_longitudinal("NP")
+res_ETA <- run_top20_longitudinal("ETA")
+res_BAL <- run_top20_longitudinal("BAL")
+
+cat("NP: OTUs with q < 0.05\n");  print(res_NP$wilcox_results  %>% filter(p_adj < 0.05))
+cat("ETA: OTUs with q < 0.05\n"); print(res_ETA$wilcox_results %>% filter(p_adj < 0.05))
+cat("BAL: OTUs with q < 0.05\n"); print(res_BAL$wilcox_results %>% filter(p_adj < 0.05))
+
+```
+
+```{r relative_abundance_plots, fig.width=9, fig.height=5}
+
+plot_top20 <- function(res, title_suffix, fill_color) {
+  ggplot(res$filtered_df, aes(x = OTU, y = Mean_Abundance, fill = timepoint_character)) +
+    geom_col(position = position_dodge(1.2), width = 0.9) +
+    geom_errorbar(aes(ymin = Mean_Abundance - SEM_Abundance, ymax = Mean_Abundance + SEM_Abundance),
+                  position = position_dodge(1.2), width = 0.3, color = "black") +
+    geom_text(data = res$filtered_df %>% filter(timepoint_character == "follow_dos" & Signif != ""),
+              aes(label = Signif, y = Mean_Abundance + SEM_Abundance + 1),
+              position = position_dodge(1.2), size = 4.5, color = "black", fontface = "bold") +
+    facet_wrap(~timepoint_character, ncol = 1, strip.position = "right") +
+    scale_fill_manual(values = c("baseline" = "lightsalmon2", "follow_dos" = "deepskyblue3")) +
+    theme_minimal() +
+    labs(title = paste("Top 20 OTUs in", title_suffix, "(Significant Differences Highlighted)"),
+         x = "OTU", y = "Relative Abundance (%)", fill = "Timepoint") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+print(plot_top20(res_NP,  "NP"))
+print(plot_top20(res_ETA, "ETA"))
+print(plot_top20(res_BAL, "BAL"))
+
+```
+
+---
+
+## 9. Genus-level Relative Abundance — Figure 4
+
+```{r genus_relabund_setup}
+
+genus_relabund <- combined_df_all %>%
+  select(specimen, tissue_type, timepoint_character) %>%
+  bind_cols(
+    as.data.frame(sweep(otu_good[combined_df_all$specimen, ], 1,
+                        rowSums(otu_good[combined_df_all$specimen, ]), "/") * 100)
+  ) %>%
+  pivot_longer(-c(specimen, tissue_type, timepoint_character),
+               names_to = "OTU", values_to = "Abundance") %>%
+  mutate(Genus = genus_lookup[OTU]) %>%
+  group_by(specimen, tissue_type, timepoint_character, Genus) %>%
+  summarise(Abundance = sum(Abundance, na.rm = TRUE), .groups = "drop")
+
+```
+
+```{r fig4_global_panels}
+
+top20_global <- genus_relabund %>%
+  group_by(Genus) %>%
+  summarise(Total = sum(Abundance)) %>%
+  arrange(desc(Total)) %>%
+  slice_head(n = 20) %>%
+  pull(Genus)
+
+# Panels A/B show the same top-20 genera faceted by tissue_type (NP/ETA/BAL),
+# separately for baseline and follow-up -- not aggregated across sites.
+df_plot_global <- genus_relabund %>%
+  filter(Genus %in% top20_global) %>%
+  group_by(timepoint_character, tissue_type, Genus) %>%
+  summarise(Mean_Abundance = mean(Abundance, na.rm = TRUE),
+            SEM_Abundance  = sd(Abundance, na.rm = TRUE) / sqrt(n()), .groups = "drop") %>%
+  mutate(Genus_label = paste0("*", Genus, "* spp."))
+
+genus_order_global <- genus_relabund %>%
+  filter(Genus %in% top20_global) %>%
+  group_by(Genus) %>%
+  summarise(Total = sum(Abundance)) %>%
+  arrange(desc(Total)) %>%
+  mutate(Genus_label = paste0("*", Genus, "* spp.")) %>%
+  pull(Genus_label)
+
+df_plot_global$Genus_label <- factor(df_plot_global$Genus_label, levels = genus_order_global)
+df_plot_global$tissue_type <- factor(df_plot_global$tissue_type, levels = c("NP", "ETA", "BAL"))
+
+time_colors <- c("baseline" = "#E8825B", "follow_dos" = "#4C72B0")
+
+fig4A <- df_plot_global %>% filter(timepoint_character == "baseline") %>%
+  ggplot(aes(x = Genus_label, y = Mean_Abundance, fill = tissue_type)) +
+  geom_col(alpha = 0.9, color = "black", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = Mean_Abundance - SEM_Abundance, ymax = Mean_Abundance + SEM_Abundance),
+                width = 0.3, color = "black") +
+  facet_grid(tissue_type ~ ., scales = "free_y") +
+  scale_fill_manual(values = tissue_colors, guide = "none") +
+  labs(x = NULL, y = "Relative Abundance (%)", title = "Baseline") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = ggtext::element_markdown(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+        strip.text  = element_text(face = "bold"))
+
+fig4B <- df_plot_global %>% filter(timepoint_character == "follow_dos") %>%
+  ggplot(aes(x = Genus_label, y = Mean_Abundance, fill = tissue_type)) +
+  geom_col(alpha = 0.9, color = "black", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = Mean_Abundance - SEM_Abundance, ymax = Mean_Abundance + SEM_Abundance),
+                width = 0.3, color = "black") +
+  facet_grid(tissue_type ~ ., scales = "free_y") +
+  scale_fill_manual(values = tissue_colors, guide = "none") +
+  labs(x = NULL, y = "Relative Abundance (%)", title = "Follow-up") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = ggtext::element_markdown(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+        strip.text  = element_text(face = "bold"))
+
+```
+
+```{r fig4_site_panels}
+
+fig4_site_panel <- function(site) {
+
+  df_site <- genus_relabund %>% filter(tissue_type == site)
+
+  top20_site <- df_site %>%
+    group_by(Genus) %>%
+    summarise(Total = sum(Abundance)) %>%
+    arrange(desc(Total)) %>%
+    slice_head(n = 20) %>%
+    pull(Genus)
+
+  df_plot <- df_site %>%
+    filter(Genus %in% top20_site) %>%
+    group_by(timepoint_character, Genus) %>%
+    summarise(Mean_Abundance = mean(Abundance, na.rm = TRUE),
+              SEM_Abundance  = sd(Abundance, na.rm = TRUE) / sqrt(n()), .groups = "drop") %>%
+    mutate(Genus_label = paste0("*", Genus, "* spp."))
+
+  genus_order_site <- df_site %>%
+    filter(Genus %in% top20_site) %>%
+    group_by(Genus) %>%
+    summarise(Total = sum(Abundance)) %>%
+    arrange(desc(Total)) %>%
+    mutate(Genus_label = paste0("*", Genus, "* spp.")) %>%
+    pull(Genus_label)
+
+  df_plot$Genus_label <- factor(df_plot$Genus_label, levels = genus_order_site)
+
+  ggplot(df_plot, aes(x = Genus_label, y = Mean_Abundance, fill = timepoint_character)) +
+    geom_col(alpha = 0.9, color = "black", linewidth = 0.2) +
+    geom_errorbar(aes(ymin = Mean_Abundance - SEM_Abundance, ymax = Mean_Abundance + SEM_Abundance),
+                  width = 0.3, color = "black") +
+    facet_grid(timepoint_character ~ .,
+               labeller = labeller(timepoint_character = c("baseline" = "Baseline", "follow_dos" = "Follow-up"))) +
+    scale_fill_manual(values = time_colors, guide = "none") +
+    labs(x = NULL, y = "Relative Abundance (%)", title = site) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = ggtext::element_markdown(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+          strip.text  = element_text(face = "bold"))
+}
+
+fig4C <- fig4_site_panel("NP")
+fig4D <- fig4_site_panel("ETA")
+fig4E <- fig4_site_panel("BAL")
+
+```
+
+```{r fig4_combined, fig.width=16, fig.height=12}
+
+fig4_top    <- fig4A | fig4B
+fig4_bottom <- fig4C | fig4D | fig4E
+
+fig4_final <- fig4_top / fig4_bottom +
+  plot_layout(heights = c(1.3, 1)) +
+  plot_annotation(tag_levels = "A")
+
+print(fig4_final)
+
+ggsave(file.path(output_dir, "Figure4_GenusAbundance_Combined.tiff"), plot = fig4_final,
+       width = 16, height = 12, dpi = 600, compression = "lzw")
+
+```
+
+---
+
+## 10. Random Forest
+
+```{r random_forest_control}
+
+control_all <- trainControl(method = "cv", number = 10, classProbs = TRUE,
+                            summaryFunction = twoClassSummary, savePredictions = "final")
+
+```
+
+```{r random_forest_all}
+
+df_rf_all <- cbind(
+  as.data.frame(otu_good[combined_df_all$specimen, ]),
+  timepoint_character = factor(
+    dplyr::recode(combined_df_all$timepoint_character, "baseline" = "Baseline", "follow_dos" = "Follow"),
+    levels = c("Baseline", "Follow"))
+)
+
+set.seed(123)
+train_idx <- createDataPartition(df_rf_all$timepoint_character, p = 0.7, list = FALSE)
+rf_all    <- train(timepoint_character ~ ., data = df_rf_all[train_idx, ],
+                   method = "rf", trControl = control_all, metric = "ROC", importance = TRUE)
+
+pred_all      <- predict(rf_all, df_rf_all[-train_idx, ])
+pred_all_prob <- predict(rf_all, df_rf_all[-train_idx, ], type = "prob")
+conf_all      <- confusionMatrix(pred_all, df_rf_all[-train_idx, "timepoint_character"])
+roc_all       <- roc(df_rf_all[-train_idx, "timepoint_character"], pred_all_prob$Follow,
+                     levels = c("Baseline", "Follow"))
+auc_all       <- auc(roc_all)
+
+print(conf_all)
+print(paste("AUC (ALL):", round(auc_all, 3)))
+```
+
+```{r random_forest_by_site}
+
+run_rf <- function(site_label, df_site) {
+  df_rf <- cbind(
+    as.data.frame(otu_good[df_site$specimen, ]),
+    timepoint_character = factor(
+      dplyr::recode(df_site$timepoint_character, "baseline" = "Baseline", "follow_dos" = "Follow"),
+      levels = c("Baseline", "Follow"))
+  )
+  set.seed(123)
+  idx   <- createDataPartition(df_rf$timepoint_character, p = 0.7, list = FALSE)
+  model <- train(timepoint_character ~ ., data = df_rf[idx, ],
+                 method = "rf", trControl = control_all, metric = "ROC", importance = TRUE)
+  pred      <- predict(model, df_rf[-idx, ])
+  pred_prob <- predict(model, df_rf[-idx, ], type = "prob")
+  conf      <- confusionMatrix(pred, df_rf[-idx, "timepoint_character"])
+  roc_obj   <- roc(df_rf[-idx, "timepoint_character"], pred_prob$Follow, levels = c("Baseline", "Follow"))
+  list(model = model, conf = conf, auc = auc(roc_obj), site = site_label)
+}
+
+rf_np  <- run_rf("NP",  combined_df_all %>% filter(tissue_type == "NP"))
+rf_eta <- run_rf("ETA", combined_df_all %>% filter(tissue_type == "ETA"))
+rf_bal <- run_rf("BAL", combined_df_all %>% filter(tissue_type == "BAL"))
+
+cat("AUC NP:",  round(rf_np$auc,  3), "\n")
+cat("AUC ETA:", round(rf_eta$auc, 3), "\n")
+cat("AUC BAL:", round(rf_bal$auc, 3), "\n")
+```
+
+```{r rf_summary}
+
+rf_summary <- data.frame(
+  Sample   = c("NP", "ETA", "BAL", "ALL"),
+  Accuracy = round(c(rf_np$conf$overall["Accuracy"], rf_eta$conf$overall["Accuracy"],
+                     rf_bal$conf$overall["Accuracy"], conf_all$overall["Accuracy"]), 3),
+  AUC      = round(c(rf_np$auc, rf_eta$auc, rf_bal$auc, auc_all), 3)
+)
+
+kable(rf_summary, caption = "Random Forest Summary — Baseline vs 72h Follow-up by Sample Type")
+write.csv(rf_summary, file.path(output_dir, "Table_RF_Summary.csv"), row.names = FALSE)
+```
+
+```{r fig5_discriminant_otus, fig.width=8, fig.height=6}
+
+rf_importance <- caret::varImp(rf_all)$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("OTU") %>%
+  mutate(Overall = rowMeans(dplyr::select(., -OTU), na.rm = TRUE)) %>%
+  arrange(desc(Overall)) %>%
+  slice_head(n = 20) %>%
+  mutate(Genus = genus_lookup[OTU],
+         Genus_label = paste0("*", Genus, "* spp.")) %>%
+  arrange(Overall)
+
+rf_importance$OTU <- factor(rf_importance$OTU, levels = rf_importance$OTU)
+
+fig5 <- ggplot(rf_importance, aes(x = OTU, y = Overall)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  coord_flip() +
+  scale_x_discrete(labels = setNames(rf_importance$Genus_label, rf_importance$OTU)) +
+  labs(x = NULL, y = "Random Forest Importance (0–100)") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.y = ggtext::element_markdown(size = 9))
+
+print(fig5)
+ggsave(file.path(output_dir, "Figure5_TopDiscriminantOTUs.tiff"), plot = fig5,
+       width = 8, height = 6, dpi = 600, compression = "lzw")
+
+```
+
+---
+
+## 11. Multivariate Analysis — mvabund
+
+<!-- anova.manyglm(..., p.uni="adjusted") uses a resampling-based step-down
+     procedure (PIT-trap resampling, nBoot replicates) to control the
+     family-wise error rate across taxa. This is distinct from Bonferroni
+     or Benjamini-Hochberg correction. -->
+
+### 11.1 Global model — tissue_type (cross-sectional, all samples, all OTUs)
+
+```{r mvabund_global_site}
+
+otu_mvabund <- as.matrix(otu_good[combined_df_all$specimen, , drop = FALSE])
+mode(otu_mvabund) <- "numeric"
+
+mv_all <- mvabund(otu_mvabund)
+
+model_site <- manyglm(mv_all ~ combined_df_all$tissue_type, family = "negative.binomial")
+anova_site <- anova(model_site, p.uni = "adjusted", nBoot = 999)
+print(anova_site$table)
+
+n_otus_mvabund_site <- ncol(otu_mvabund)
+cat("Number of OTUs in test family (mvabund, site model):", n_otus_mvabund_site, "\n")
+
+```
+
+### 11.2 Longitudinal model — timepoint * tissue_type interaction, all OTUs
+
+```{r mvabund_longitudinal_interaction}
+
+otu_mva_all <- mvabund(combined_df_all[, str_which(colnames(combined_df_all), "Otu")])
+
+otu_model_all <- manyglm(otu_mva_all ~ timepoint_character * tissue_type, data = combined_df_all)
+anova_mvabund_all <- anova(otu_model_all, p.uni = "adjusted", nBoot = 999)
+print(anova_mvabund_all$table)
+
+n_otus_mvabund_longit <- ncol(otu_mva_all)
+cat("Number of OTUs in test family (mvabund, longitudinal model):", n_otus_mvabund_longit, "\n")
+
+```
+
+### 11.3 Global model — top-20 OTU subset (cross-sectional comparison across sites)
+
+```{r mvabund_subconjunto_20otus}
+
+# Top-20 most abundant OTUs globally (all samples, both timepoints),
+# same subset used in Figure 4 (panels A/B).
+rel_all <- sweep(otu_good[combined_df_all$specimen, ], 1,
+                 rowSums(otu_good[combined_df_all$specimen, ]), "/") * 100
+
+top20_global_otus <- colSums(rel_all) %>%
+  sort(decreasing = TRUE) %>%
+  head(20) %>%
+  names()
+
+otu_top20_matrix <- as.matrix(otu_good[combined_df_all$specimen, top20_global_otus, drop = FALSE])
+mode(otu_top20_matrix) <- "numeric"
+
+mv_top20 <- mvabund(otu_top20_matrix)
+
+model_top20_site <- manyglm(mv_top20 ~ combined_df_all$tissue_type, family = "negative.binomial")
+anova_top20_site <- anova(model_top20_site, p.uni = "adjusted", nBoot = 999)
+
+cat("mvabund, top-20 global OTUs ~ tissue_type: global test\n")
+print(anova_top20_site$table)
+
+cat("Per-OTU results, ordered by adjusted p-value\n")
+per_otu_top20 <- anova_top20_site$uni.p %>%
+  as.data.frame() %>%
+  rownames_to_column("Comparison") %>%
+  pivot_longer(-Comparison, names_to = "OTU", values_to = "p_adj") %>%
+  mutate(Genus = genus_lookup[OTU]) %>%
+  arrange(p_adj)
+print(per_otu_top20)
+
+cat("Staphylococcus-specific result\n")
+print(per_otu_top20 %>% filter(str_detect(Genus, "Staphylococcus")))
+
+```
+
+---
+
+## 12. Summary of Statistical Methods and Multiple-Comparison Corrections
+
+```{r summary_table_reviewer}
+
+stats_summary <- tribble(
+  ~Analysis, ~Test, ~Correction_Method, ~N_tests_in_family, ~Notes,
+
+  "Alpha diversity, pairwise site comparisons (baseline)", "Wilcoxon rank-sum (pairwise)", "Bonferroni", "3 (NP-ETA, NP-BAL, ETA-BAL)", "Independent family per timepoint",
+  "Alpha diversity, pairwise site comparisons (follow-up)", "Wilcoxon rank-sum (pairwise)", "Bonferroni", "3 (NP-ETA, NP-BAL, ETA-BAL)", "Independent family per timepoint",
+  "Alpha diversity, global site comparison (baseline)", "Kruskal-Wallis", "None (single omnibus test)", "1", "Precedes pairwise post-hoc",
+  "Alpha diversity, global site comparison (follow-up)", "Kruskal-Wallis", "None (single omnibus test)", "1", "Precedes pairwise post-hoc",
+  "Alpha diversity, longitudinal within NP/ETA/BAL", "Wilcoxon rank-sum (independent tests per tissue)", "None applied across tissues", "1 per tissue (3 total)", "",
+  "Relative abundance, longitudinal per-OTU (NP)", "Wilcoxon rank-sum, per OTU", "Benjamini-Hochberg (BH)", "20 (top-20 OTUs by abundance in NP)", "0 OTUs reached q<0.05 in NP",
+  "Relative abundance, longitudinal per-OTU (ETA)", "Wilcoxon rank-sum, per OTU", "Benjamini-Hochberg (BH)", "20 (top-20 OTUs by abundance in ETA)", "",
+  "Relative abundance, longitudinal per-OTU (BAL)", "Wilcoxon rank-sum, per OTU", "Benjamini-Hochberg (BH)", "20 (top-20 OTUs by abundance in BAL)", "",
+  "Relative abundance, cross-sectional (top-20 OTU subset)", "mvabund::manyglm, resampling ANOVA", "Resampling-based step-down (PIT-trap, nBoot=999)", "20 (top-20 global OTUs)", "See section 11.3",
+  "Multivariate GLM, global site model (all OTUs)", "mvabund::manyglm, resampling ANOVA", "Resampling-based step-down (PIT-trap, nBoot=999)", "N = total OTUs in model", "Not Bonferroni/BH",
+  "Multivariate GLM, longitudinal interaction model (all OTUs)", "mvabund::manyglm, resampling ANOVA", "Resampling-based step-down (PIT-trap, nBoot=999)", "N = total OTUs in model", "Not Bonferroni/BH",
+  "Beta diversity, PERMANOVA (cross-sectional, by site)", "PERMANOVA (adonis2, Bray-Curtis)", "None (single omnibus test per comparison)", "1", "",
+  "Beta diversity, PERMANOVA (longitudinal, per tissue)", "PERMANOVA (adonis2, Bray-Curtis)", "None applied across tissues", "1 per tissue (3 total)", ""
+)
+
+kable(stats_summary, caption = "Statistical tests and multiple-comparison corrections used across analyses")
+write.csv(stats_summary, file.path(output_dir, "Table_Statistical_Methods_Summary.csv"), row.names = FALSE)
+
+```
+
+---
+
+## 13. Session Info
+
+```{r session_info}
+sessionInfo()
+```

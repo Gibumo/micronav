@@ -1,0 +1,11 @@
+services:
+  mvabund-analysis:
+    build: .
+    container_name: mvabund-job
+    env_file:
+      - .env
+    volumes:
+      - ./output:/analysis/output
+    # El job corre una vez y termina (no es un servicio de larga duración),
+    # así que no reiniciamos automáticamente ni al fallar ni al terminar.
+    restart: "no"

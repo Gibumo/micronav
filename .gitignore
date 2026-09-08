@@ -1,0 +1,11 @@
+﻿.env
+output/
+data/
+*.html
+*.pdf
+*_cache/
+*_files/
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
