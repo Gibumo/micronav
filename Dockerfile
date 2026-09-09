@@ -1,4 +1,4 @@
-FROM rocker/verse:4.4.1
+FROM rocker/verse:4.5.3
 # rocker/verse ya trae: R, tidyverse, rmarkdown, pandoc y tinytex (LaTeX
 # liviano) -- eso cubre pdf_document y html_document sin instalar TeX Live
 # completo (~4GB). Si nunca usas el output PDF, cambia a rocker/tidyverse
