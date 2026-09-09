@@ -15,8 +15,8 @@ set -euo pipefail
 # AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION antes del docker run.
 
 OUTPUT_FORMAT="${OUTPUT_FORMAT:-html_document}"
-DATA_DIR="${DATA_DIR:-/analysis/data}"
-OUTPUT_DIR="${OUTPUT_DIR:-/analysis/output}"
+export DATA_DIR="${DATA_DIR:-/analysis/data}"
+export OUTPUT_DIR="${OUTPUT_DIR:-/analysis/output}"
 
 mkdir -p "$DATA_DIR" "$OUTPUT_DIR"
 
