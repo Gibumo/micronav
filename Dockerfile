@@ -12,28 +12,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     gfortran \
     libopenblas-dev \
+    libgsl-dev \
     awscli \
     && rm -rf /var/lib/apt/lists/*
 
+# 'Deriv' aparte primero, en su propia capa -- rompe cualquier problema de
+# caché de índice de CRAN que arrastraran los paquetes que dependen de él
+# (doBy, etc.) más adelante.
+RUN R -e "install.packages('Deriv', repos = 'https://cloud.r-project.org')"
+
 # Paquetes de CRAN que no vienen en rocker/verse.
-# Reintenta hasta 3 veces los paquetes que falten (los tropiezos de red/mirror
-# de CRAN durante el build, como con la dependencia 'Deriv', suelen ser
-# momentáneos y se resuelven solos en un segundo intento). Si después de 3
-# intentos algo sigue faltando, el "docker build" falla con la lista exacta.
-RUN R -e " \
+# Reintenta hasta 3 veces, cada intento en un PROCESO DE R NUEVO (no un loop
+# dentro de la misma sesión) -- así cada intento vuelve a consultar el índice
+# de CRAN desde cero en vez de reusar una lista cacheada que puede haber
+# quedado incompleta por un tropiezo de red momentáneo.
+RUN for i in 1 2 3; do \
+      echo "=== Intento $i de instalación de paquetes ==="; \
+      Rscript -e " \
+        pkgs <- c('vegan', 'ggpubr', 'mvabund', 'openxlsx', 'readxl', 'tableone', \
+                  'matrixStats', 'cowplot', 'patchwork', 'randomForest', 'caret', \
+                  'pROC', 'car', 'rstatix', 'FSA', 'ggtext', 'data.table'); \
+        falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
+        if (length(falta) > 0) install.packages(falta, repos = 'https://cloud.r-project.org', \
+                          Ncpus = parallel::detectCores()); \
+        falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
+        if (length(falta) > 0) { message('Faltan: ', paste(falta, collapse=', ')); quit(status = 1) }" \
+      && break; \
+      echo "Intento $i falló, reintentando en 5s..."; \
+      sleep 5; \
+    done; \
+    Rscript -e " \
       pkgs <- c('vegan', 'ggpubr', 'mvabund', 'openxlsx', 'readxl', 'tableone', \
                 'matrixStats', 'cowplot', 'patchwork', 'randomForest', 'caret', \
                 'pROC', 'car', 'rstatix', 'FSA', 'ggtext', 'data.table'); \
-      for (i in 1:3) { \
-        falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
-        if (length(falta) == 0) break; \
-        message('Intento ', i, ' -- instalando: ', paste(falta, collapse = ', ')); \
-        install.packages(falta, repos = 'https://cloud.r-project.org', \
-                          Ncpus = parallel::detectCores()); \
-      }; \
       falta <- pkgs[!(pkgs %in% rownames(installed.packages()))]; \
-      if (length(falta) > 0) stop('No se instalaron: ', paste(falta, collapse = ', ')) \
-    "
+      if (length(falta) > 0) stop('No se instalaron: ', paste(falta, collapse = ', '))"
 
 # Re-instala xfun/knitr/rmarkdown/evaluate JUNTOS al final, para que queden
 # en versiones mutuamente compatibles. Sin esto, instalar los paquetes de
