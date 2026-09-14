@@ -74,13 +74,38 @@ RUN for i in 1 2 3; do \
 RUN R -e "install.packages(c('xfun', 'knitr', 'rmarkdown', 'evaluate'), \
       repos = 'https://cloud.r-project.org')"
 
+# --- AGREGADO ---
+# Bioconductor + MaAsLin2, necesarios para la sección 8.1 (sensitivity
+# analysis) del .Rmd. El chunk que instala Maaslin2 dentro del propio .Rmd
+# tiene eval=FALSE (no corre en el render automático), así que tiene que
+# quedar instalado aquí, en la imagen. Con reintentos igual que los bloques
+# de arriba, porque BiocManager::install también puede fallar por red.
+RUN for i in 1 2 3; do \
+      echo "=== Intento $i instalando Maaslin2 ==="; \
+      Rscript -e " \
+        if (!requireNamespace('BiocManager', quietly = TRUE)) \
+          install.packages('BiocManager', repos = 'https://cloud.r-project.org'); \
+        if (!requireNamespace('Maaslin2', quietly = TRUE)) \
+          BiocManager::install('Maaslin2', update = FALSE, ask = FALSE); \
+        if (!requireNamespace('Maaslin2', quietly = TRUE)) quit(status = 1)" \
+      && break; \
+      echo "Intento $i de Maaslin2 falló, reintentando en 5s..."; \
+      sleep 5; \
+    done; \
+    Rscript -e "if (!requireNamespace('Maaslin2', quietly = TRUE)) stop('Maaslin2 no se pudo instalar')"
+# --- FIN AGREGADO ---
+# Nota: ANCOM-BC deliberadamente NO se instala aquí. El propio .Rmd (sección
+# 8.1) documenta que falla por incompatibilidad conocida entre los paquetes
+# ANCOMBC y CVXR (ANCOMBC GitHub issue #332); instalarlo solo agregaría un
+# punto de fallo al build sin aportar nada, ya que el análisis no lo usa.
+
 WORKDIR /analysis
 
 # El .Rmd y el script de render/subida se copian al construir la imagen.
 # Los DATOS (los 3 archivos de /1 - Equipo/Descargas/dickson) NO se copian
 # aquí -- se montan como volumen en el docker run (ver comando abajo),
 # así puedes reusar la misma imagen con datos distintos sin reconstruirla.
-COPY analysis.Rmd .
+COPY comparison_samples_09092026.Rmd .
 COPY render_and_upload.sh .
 RUN chmod +x render_and_upload.sh
 

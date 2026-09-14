@@ -27,8 +27,8 @@ mechanically ventilated ICU patients (n = 141; sequencing runs R231, R572, R575)
 Sections:
 
 - Data loading, taxonomy annotation, and quality filtering (sections 4–5)
-- Beta diversity: PCoA and PERMANOVA (section 6)
-- Alpha diversity: Shannon index (section 7)
+- Beta diversity: PCoA, PERMANOVA, and pairing analyses (section 6)
+- Alpha diversity: Shannon index, richness, and evenness (section 7)
 - Relative abundance and differential abundance testing (sections 8–9)
 - Random Forest classification (section 10)
 - Multivariate modeling with `mvabund` (section 11)
@@ -103,7 +103,7 @@ library(ggtext)   # required for italicized genus labels in Fig. 4 and Fig. 5
 ```{r import_otu}
 
 # Local (Windows/RStudio): falls back to the original OneDrive path.
-# Docker: set DATA_DIR=/analysis/data (mounted volume with the 3 input files).
+# Docker: set DATA_DIR=/analysis/data (mounted volume with the input files).
 data_dir <- Sys.getenv(
   "DATA_DIR",
   "C:/Users/ingridbumo/OneDrive - Universidad de la Sabana/1 - Equipo/Descargas/dickson"
@@ -131,6 +131,7 @@ rownames(otu_good) <- rownames(otu_trim) %>%
 
 print(paste("OTU table:", nrow(otu_good), "samples x", ncol(otu_good), "OTUs"))
 print(paste("Sequencing runs:", paste(unique(str_extract(rownames(otu_good), "^R\\d+")), collapse = ", ")))
+
 ```
 
 ### 4.2 Taxonomy
@@ -211,13 +212,24 @@ combined_df_all <- otu_df %>%
   filter(specimen %in% rownames(otu_good)) %>%
   droplevels()
 
-# Check for duplicate specimen IDs before proceeding
+# Check for duplicate specimen IDs before proceeding. If found, keep only
+# the first occurrence -- this is not a cosmetic fix: a duplicated specimen
+# ID means two clinical records point to the same sequencing data, and
+# leaving both in place silently fabricates a data point for one of the two
+# timepoints/tissues. See investigation notes: for the one duplicate found
+# in this dataset (R575_257_1_NASAL), the two rows had different clinical
+# data (different visit dates, ventilator settings) but identical OTU counts,
+# indicating a metadata labeling error for the follow-up specimen rather than
+# a true duplicate measurement.
 dup_specimens <- combined_df_all$specimen[duplicated(combined_df_all$specimen)]
 if (length(dup_specimens) > 0) {
   cat("WARNING:", length(dup_specimens), "duplicated specimen ID(s) in combined_df_all:\n")
   print(dup_specimens)
   print(combined_df_all %>% filter(specimen %in% dup_specimens) %>%
           select(specimen, tissue_type, timepoint_character))
+
+  combined_df_all <- combined_df_all %>% distinct(specimen, .keep_all = TRUE)
+  cat("Duplicates removed; kept first occurrence of each specimen ID.\n")
 }
 
 print(paste("combined_df_all (before depth filtering):", nrow(combined_df_all), "samples"))
@@ -262,8 +274,6 @@ tissue_colors    <- c("NP" = "indianred3", "ETA" = "cyan3", "BAL" = "plum3")
 timepoint_colors <- c("baseline" = "goldenrod2", "follow_dos" = "steelblue3")
 pcapal_new       <- colorRampPalette(brewer.pal(9, "Set1"))(15)
 ```
-
----
 
 ## 5. Clinical Descriptive Analysis
 
@@ -318,7 +328,6 @@ ggplot(diagnosis_counts,
         plot.title   = element_text(size = 13, face = "bold", hjust = 0.5))
 ```
 
----
 
 ## 6. Beta Diversity — PCoA and PERMANOVA
 
@@ -340,6 +349,7 @@ pcoa_df_all <- as.data.frame(otu_pcoa_all$points)[, 1:2]
 colnames(pcoa_df_all) <- c("PCoA1", "PCoA2")
 pcoa_df_all$TissueType <- combined_df_all$tissue_type
 pcoa_df_all$Timepoint  <- combined_df_all$timepoint_character
+pcoa_df_all$PatientID  <- combined_df_all$patient_id
 
 stopifnot(!any(is.na(pcoa_df_all)))
 
@@ -353,7 +363,6 @@ ggplot(pcoa_df_all, aes(x = PCoA1, y = PCoA2, color = TissueType, shape = Timepo
        color = "Tissue Type", shape = "Timepoint") +
   theme_minimal()
 
-# Global PERMANOVA by anatomical site (all samples)
 permanova_site <- adonis2(formula = otu_dist_bray_all ~ tissue_type,
                           data = combined_df_all, permutations = 999, method = "bray")
 print(permanova_site)
@@ -384,6 +393,27 @@ print(permanova_follow)
 
 ```
 
+```{r permanova_directo_eta_bal}
+
+## Direct pairwise PERMANOVA: ETA vs BAL only (excluding NP), per timepoint.
+## Addresses whether ETA and BAL are statistically distinguishable in beta
+## diversity, beyond the 3-group omnibus test already reported.
+
+run_eta_bal_permanova <- function(timepoint_filter) {
+  df <- combined_df_all %>%
+    filter(timepoint_character == timepoint_filter, tissue_type %in% c("ETA", "BAL")) %>%
+    droplevels()
+  mat <- otu_good[df$specimen, , drop = FALSE]
+  set.seed(9999)
+  dist_bc <- vegdist(mat, method = "bray")
+  adonis2(dist_bc ~ tissue_type, data = df, permutations = 9999)
+}
+
+cat("ETA vs BAL only, baseline:\n"); print(run_eta_bal_permanova("baseline"))
+cat("ETA vs BAL only, follow-up:\n"); print(run_eta_bal_permanova("follow_dos"))
+
+```
+
 ### 6.3 PERMANOVA — Longitudinal within each tissue (baseline vs follow-up)
 
 ```{r permanova_longitudinal_by_tissue}
@@ -406,7 +436,111 @@ print(perm_bal)
 
 ```
 
-### 6.4 Figure 2 — Beta Diversity (5-panel: cross-sectional + longitudinal)
+### 6.4 Site-pair distance and within- vs. between-patient similarity (ETA-BAL)
+
+```{r site_pair_distances}
+
+## Mean Bray-Curtis distance between each pair of anatomical sites, per timepoint
+mean_dist_by_site_pair <- function(timepoint_filter) {
+  df <- combined_df_all %>% filter(timepoint_character == timepoint_filter) %>% droplevels()
+  mat <- otu_good[df$specimen, , drop = FALSE]
+  dist_bc <- as.matrix(vegdist(mat, method = "bray"))
+
+  site_pairs <- combn(unique(df$tissue_type), 2, simplify = FALSE)
+  purrr::map_dfr(site_pairs, function(pair) {
+    idx1 <- df$specimen[df$tissue_type == pair[1]]
+    idx2 <- df$specimen[df$tissue_type == pair[2]]
+    tibble(Pair = paste(pair, collapse = "-"),
+           Mean_Distance = mean(dist_bc[idx1, idx2]),
+           Median_Distance = median(dist_bc[idx1, idx2]))
+  })
+}
+
+cat("Baseline:\n"); print(mean_dist_by_site_pair("baseline"))
+cat("Follow-up:\n"); print(mean_dist_by_site_pair("follow_dos"))
+
+```
+
+```{r within_vs_between_patient_permutation}
+
+## Permutation test: are ETA-BAL pairs from the SAME patient more similar
+## than ETA-BAL pairs from DIFFERENT patients?
+
+test_within_vs_between_patient <- function(timepoint_filter, n_perm = 999) {
+  df <- combined_df_all %>% filter(timepoint_character == timepoint_filter) %>% droplevels()
+  mat <- otu_good[df$specimen, , drop = FALSE]
+  dist_bc <- as.matrix(vegdist(mat, method = "bray"))
+
+  eta_df <- df %>% filter(tissue_type == "ETA")
+  bal_df <- df %>% filter(tissue_type == "BAL")
+  paired <- inner_join(eta_df, bal_df, by = "patient_id", suffix = c("_ETA", "_BAL"))
+
+  observed <- mean(mapply(function(e, b) dist_bc[e, b],
+                          paired$specimen_ETA, paired$specimen_BAL))
+
+  set.seed(1234)
+  perm_means <- replicate(n_perm, {
+    shuffled_bal <- sample(paired$specimen_BAL)
+    mean(mapply(function(e, b) dist_bc[e, b], paired$specimen_ETA, shuffled_bal))
+  })
+
+  # Corrected permutation p-value formula: avoids ever reporting exactly 0
+  p_value <- (1 + sum(perm_means <= observed)) / (1 + n_perm)
+  list(observed = observed, perm_mean = mean(perm_means), p_value = p_value, n_pairs = nrow(paired))
+}
+
+cat("Baseline, ETA-BAL within- vs between-patient:\n")
+print(test_within_vs_between_patient("baseline"))
+cat("Follow-up, ETA-BAL within- vs between-patient:\n")
+print(test_within_vs_between_patient("follow_dos"))
+
+```
+
+```{r temporal_stability_permutation}
+
+## Permutation test: is a patient's own baseline-to-follow-up pair (same
+## tissue) more similar than baseline-follow-up pairs across DIFFERENT
+## patients? Tests within-patient temporal stability, per tissue type.
+test_temporal_stability <- function(site, n_perm = 999) {
+  df <- combined_df_all %>% filter(tissue_type == site) %>% droplevels()
+  mat <- otu_good[df$specimen, , drop = FALSE]
+  dist_bc <- as.matrix(vegdist(mat, method = "bray"))
+
+  baseline_df <- df %>% filter(timepoint_character == "baseline")
+  follow_df   <- df %>% filter(timepoint_character == "follow_dos")
+  paired <- inner_join(baseline_df, follow_df, by = "patient_id",
+                       suffix = c("_baseline", "_follow"))
+
+  patient_distances <- mapply(function(b, f) dist_bc[b, f],
+                              paired$specimen_baseline, paired$specimen_follow)
+  observed <- mean(patient_distances)
+
+  set.seed(1234)
+  perm_means <- replicate(n_perm, {
+    shuffled_follow <- sample(paired$specimen_follow)
+    mean(mapply(function(b, f) dist_bc[b, f], paired$specimen_baseline, shuffled_follow))
+  })
+
+  p_value <- (1 + sum(perm_means <= observed)) / (1 + n_perm)
+
+  list(
+    site = site,
+    observed_mean  = observed,
+    observed_sd    = sd(patient_distances),
+    observed_range = range(patient_distances),
+    perm_mean = mean(perm_means),
+    p_value = p_value,
+    n_pairs = nrow(paired)
+  )
+}
+
+cat("NP temporal stability:\n");  print(test_temporal_stability("NP"))
+cat("ETA temporal stability:\n"); print(test_temporal_stability("ETA"))
+cat("BAL temporal stability:\n"); print(test_temporal_stability("BAL"))
+
+```
+
+### 6.5 Figure 2 — Beta Diversity (5-panel: cross-sectional + longitudinal)
 
 ```{r figure2_helper}
 
@@ -553,9 +687,7 @@ ggsave(file.path(output_dir, "Figure2_BetaDiversity_Combined.tiff"), plot = fig2
 
 ```
 
----
-
-## 7. Alpha Diversity — Shannon Index
+## 7. Alpha Diversity — Shannon Index, Richness, and Evenness
 
 ### 7.1 Baseline: NP vs ETA vs BAL
 
@@ -571,6 +703,7 @@ shan_df <- div_df_baseline %>%
 
 kw_b <- kruskal.test(Shannon ~ tissue_type, data = shan_df)
 print(kw_b)
+
 ```
 
 ### 7.2 Follow-up: NP vs ETA vs BAL
@@ -587,16 +720,25 @@ shan_df_f <- div_df_follow %>%
 
 kw_f <- kruskal.test(Shannon ~ tissue_type, data = shan_df_f)
 print(kw_f)
+
 ```
 
 ### 7.3 Longitudinal Alpha Diversity: NP, ETA, BAL
+
+Shannon diversity is decomposed into richness (observed OTUs) and Pielou's
+evenness (Shannon / log(richness)) to clarify whether longitudinal changes
+reflect loss of taxa, redistribution of dominance among existing taxa, or both.
 
 ```{r alpha_diversity_longitudinal}
 
 calc_shannon <- function(df_site) {
   mat <- as.matrix(otu_good[df_site$specimen, , drop = FALSE])
   mode(mat) <- "numeric"; mat[is.na(mat)] <- 0
-  df_site %>% mutate(Shannon = diversity(mat, index = "shannon"))
+  df_site %>% mutate(
+    Shannon  = diversity(mat, index = "shannon"),
+    Richness = specnumber(mat),
+    Evenness = Shannon / log(Richness)
+  )
 }
 
 shan_NP_all  <- combined_df_all %>% filter(tissue_type == "NP")  %>% calc_shannon()
@@ -614,6 +756,31 @@ print(wilcox.test(Shannon ~ timepoint_character, data = shan_ETA_all))
 cat("BAL, baseline vs follow-up\n")
 print(kruskal.test(Shannon ~ timepoint_character, data = shan_BAL_all))
 print(wilcox.test(Shannon ~ timepoint_character, data = shan_BAL_all))
+
+```
+
+```{r richness_evenness_decomposition}
+
+cat("Richness (observed OTUs), baseline vs follow-up\n")
+cat("NP:\n");  print(wilcox.test(Richness ~ timepoint_character, data = shan_NP_all))
+cat("ETA:\n"); print(wilcox.test(Richness ~ timepoint_character, data = shan_ETA_all))
+cat("BAL:\n"); print(wilcox.test(Richness ~ timepoint_character, data = shan_BAL_all))
+
+cat("Evenness (Pielou's J), baseline vs follow-up\n")
+cat("NP:\n");  print(wilcox.test(Evenness ~ timepoint_character, data = shan_NP_all))
+cat("ETA:\n"); print(wilcox.test(Evenness ~ timepoint_character, data = shan_ETA_all))
+cat("BAL:\n"); print(wilcox.test(Evenness ~ timepoint_character, data = shan_BAL_all))
+
+cat("Descriptive summary (median [IQR]) by tissue and timepoint\n")
+bind_rows(shan_NP_all, shan_ETA_all, shan_BAL_all) %>%
+  group_by(tissue_type, timepoint_character) %>%
+  summarise(
+    Shannon_median  = median(Shannon),  Shannon_IQR  = IQR(Shannon),
+    Richness_median = median(Richness), Richness_IQR = IQR(Richness),
+    Evenness_median = median(Evenness), Evenness_IQR = IQR(Evenness),
+    .groups = "drop"
+  ) %>%
+  print(n = Inf)
 
 ```
 
@@ -665,9 +832,10 @@ build_violin_longitudinal <- function(df_site, site_label, follow_color) {
 
   cols_label <- c("Baseline" = "goldenrod2", "Follow-up" = follow_color)
 
-  ggplot(df_plot, aes(x = Timepoint_label, y = Shannon, fill = Timepoint_label)) +
-    geom_violin(alpha = 0.5, color = "black") +
-    geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, color = "black") +
+  ggplot(df_plot, aes(x = Timepoint_label, y = Shannon)) +
+    geom_line(aes(group = patient_id), color = "gray60", alpha = 0.3, linewidth = 0.3) +
+    geom_violin(aes(fill = Timepoint_label), alpha = 0.5, color = "black") +
+    geom_boxplot(aes(fill = Timepoint_label), width = 0.12, outlier.shape = NA, alpha = 0.8, color = "black") +
     geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "black") +
     scale_fill_manual(values = cols_label) +
     labs(title = site_label, y = "Shannon Diversity Index", x = "Timepoint") +
@@ -711,7 +879,44 @@ print(pairwise.wilcox.test(shan_df_f$Shannon, shan_df_f$tissue_type, p.adjust.me
 
 ```
 
----
+### 7.5 Bacterial burden (16S copies/µL)
+
+```{r bacterial_burden_analysis}
+
+combined_df_all <- combined_df_all %>%
+  mutate(copies_ul_dna = suppressWarnings(as.numeric(copies_ul_dna)))
+
+burden_df <- combined_df_all %>%
+  select(specimen, tissue_type, timepoint_character, copies_ul_dna) %>%
+  filter(!is.na(copies_ul_dna))
+
+cat("N samples with bacterial burden data:", nrow(burden_df), "of", nrow(combined_df_all), "\n")
+
+cat("Bacterial burden (copies/µL) by site, median [IQR]\n")
+print(
+  burden_df %>%
+    group_by(tissue_type) %>%
+    summarise(n = n(), median = median(copies_ul_dna),
+              IQR_low = quantile(copies_ul_dna, 0.25),
+              IQR_high = quantile(copies_ul_dna, 0.75))
+)
+
+cat("Kruskal-Wallis: bacterial burden across sites\n")
+print(kruskal.test(copies_ul_dna ~ tissue_type, data = burden_df))
+
+burden_shannon <- burden_df %>%
+  left_join(bind_rows(shan_df, shan_df_f) %>% select(specimen, Shannon), by = "specimen")
+
+cat("Correlation (Spearman): bacterial burden vs Shannon\n")
+print(cor.test(burden_shannon$copies_ul_dna, burden_shannon$Shannon, method = "spearman"))
+
+burden_depth <- burden_df %>%
+  mutate(seq_depth = rowSums(otu_good[specimen, ]))
+
+cat("Correlation (Spearman): bacterial burden vs sequencing depth\n")
+print(cor.test(burden_depth$copies_ul_dna, burden_depth$seq_depth, method = "spearman"))
+
+```
 
 ## 8. Relative Abundance — Longitudinal (baseline vs follow-up), per tissue, top-20 OTUs
 
@@ -797,7 +1002,79 @@ print(plot_top20(res_BAL, "BAL"))
 
 ```
 
----
+### 8.1 Sensitivity Analysis: MaAsLin2
+
+Wilcoxon rank-sum testing on relative abundances does not account for the
+compositional nature of microbiome data (Gloor et al. 2017). As a sensitivity
+check, the same longitudinal per-tissue comparisons (top-20 OTUs, above) are
+repeated with MaAsLin2, a composition-aware differential abundance method.
+ANCOM-BC was also attempted but could not be loaded due to a known,
+unresolved incompatibility between the ANCOMBC and CVXR packages
+(ANCOMBC GitHub issue #332).
+
+```{r sensitivity_packages, eval=FALSE}
+
+# Run once to install (not part of routine execution)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("Maaslin2"))
+
+```
+
+```{r sensitivity_maaslin2}
+
+library(Maaslin2)
+
+run_maaslin2_for_site <- function(site, top20_otus) {
+
+  df_site <- combined_df_all %>% filter(tissue_type == site) %>% droplevels()
+  counts  <- otu_good[df_site$specimen, top20_otus, drop = FALSE]  # samples x taxa
+
+  sample_data_df <- data.frame(
+    row.names = df_site$specimen,
+    timepoint = df_site$timepoint_character
+  )
+
+  maaslin_dir <- file.path(output_dir, "maaslin2_output", site)
+  dir.create(maaslin_dir, recursive = TRUE, showWarnings = FALSE)
+
+  maaslin_res <- Maaslin2(
+    input_data     = as.data.frame(counts),
+    input_metadata = sample_data_df,
+    output         = maaslin_dir,
+    fixed_effects  = "timepoint",
+    normalization  = "TSS",
+    transform      = "LOG",
+    plot_heatmap   = FALSE,
+    plot_scatter   = FALSE
+  )
+
+  maaslin_res$results %>%
+    filter(metadata == "timepoint") %>%
+    select(feature, qval) %>%
+    rename(OTU = feature, q_maaslin2 = qval) %>%
+    mutate(Genus = genus_lookup[OTU], Site = site)
+}
+
+sens_NP  <- run_maaslin2_for_site("NP",  res_NP$top20)
+sens_ETA <- run_maaslin2_for_site("ETA", res_ETA$top20)
+sens_BAL <- run_maaslin2_for_site("BAL", res_BAL$top20)
+
+cat("Comparison of q-values: Wilcoxon+BH vs MaAsLin2\n")
+sensitivity_comparison <- bind_rows(
+  res_NP$wilcox_results  %>% mutate(Site = "NP"),
+  res_ETA$wilcox_results %>% mutate(Site = "ETA"),
+  res_BAL$wilcox_results %>% mutate(Site = "BAL")
+) %>%
+  rename(q_wilcoxon = p_adj) %>%
+  select(Site, OTU, Genus, q_wilcoxon) %>%
+  left_join(bind_rows(sens_NP, sens_ETA, sens_BAL) %>% select(Site, OTU, q_maaslin2),
+            by = c("Site", "OTU")) %>%
+  arrange(Site, q_wilcoxon)
+
+print(sensitivity_comparison, n = Inf)
+write.csv(sensitivity_comparison, file.path(output_dir, "Table_Sensitivity_MaAsLin2.csv"), row.names = FALSE)
+
+```
 
 ## 9. Genus-level Relative Abundance — Figure 4
 
@@ -939,8 +1216,6 @@ ggsave(file.path(output_dir, "Figure4_GenusAbundance_Combined.tiff"), plot = fig
 
 ```
 
----
-
 ## 10. Random Forest
 
 ```{r random_forest_control}
@@ -1004,6 +1279,37 @@ cat("AUC ETA:", round(rf_eta$auc, 3), "\n")
 cat("AUC BAL:", round(rf_bal$auc, 3), "\n")
 ```
 
+### 10.1 Positive control: site classification
+
+As a positive control, a Random Forest model was trained to classify anatomical
+site (NP/ETA/BAL) using the same pipeline as above. High accuracy here confirms
+the modeling approach is capable of detecting known differences, supporting the
+interpretation that near-chance performance for baseline-vs-follow-up reflects
+a genuinely subtle temporal signal rather than a limitation of the method itself.
+
+```{r random_forest_site_classification}
+
+df_rf_site <- cbind(
+  as.data.frame(otu_good[combined_df_all$specimen, ]),
+  tissue_type = combined_df_all$tissue_type
+)
+
+set.seed(123)
+train_idx_site <- createDataPartition(df_rf_site$tissue_type, p = 0.7, list = FALSE)
+
+control_site <- trainControl(method = "cv", number = 10, savePredictions = "final")
+
+rf_site <- train(tissue_type ~ ., data = df_rf_site[train_idx_site, ],
+                 method = "rf", trControl = control_site, importance = TRUE)
+
+pred_site <- predict(rf_site, df_rf_site[-train_idx_site, ])
+conf_site <- confusionMatrix(pred_site, df_rf_site[-train_idx_site, "tissue_type"])
+
+print(conf_site)
+cat("Overall accuracy (site classification):", round(conf_site$overall["Accuracy"], 3), "\n")
+
+```
+
 ```{r rf_summary}
 
 rf_summary <- data.frame(
@@ -1044,8 +1350,6 @@ ggsave(file.path(output_dir, "Figure5_TopDiscriminantOTUs.tiff"), plot = fig5,
        width = 8, height = 6, dpi = 600, compression = "lzw")
 
 ```
-
----
 
 ## 11. Multivariate Analysis — mvabund
 
@@ -1126,8 +1430,6 @@ print(per_otu_top20 %>% filter(str_detect(Genus, "Staphylococcus")))
 
 ```
 
----
-
 ## 12. Summary of Statistical Methods and Multiple-Comparison Corrections
 
 ```{r summary_table_reviewer}
@@ -1147,15 +1449,16 @@ stats_summary <- tribble(
   "Multivariate GLM, global site model (all OTUs)", "mvabund::manyglm, resampling ANOVA", "Resampling-based step-down (PIT-trap, nBoot=999)", "N = total OTUs in model", "Not Bonferroni/BH",
   "Multivariate GLM, longitudinal interaction model (all OTUs)", "mvabund::manyglm, resampling ANOVA", "Resampling-based step-down (PIT-trap, nBoot=999)", "N = total OTUs in model", "Not Bonferroni/BH",
   "Beta diversity, PERMANOVA (cross-sectional, by site)", "PERMANOVA (adonis2, Bray-Curtis)", "None (single omnibus test per comparison)", "1", "",
-  "Beta diversity, PERMANOVA (longitudinal, per tissue)", "PERMANOVA (adonis2, Bray-Curtis)", "None applied across tissues", "1 per tissue (3 total)", ""
+  "Beta diversity, PERMANOVA (cross-sectional, ETA vs BAL only)", "PERMANOVA (adonis2, Bray-Curtis)", "None (single pairwise test per timepoint)", "1 per timepoint (2 total)", "",
+  "Beta diversity, PERMANOVA (longitudinal, per tissue)", "PERMANOVA (adonis2, Bray-Curtis)", "None applied across tissues", "1 per tissue (3 total)", "",
+  "Beta diversity, within- vs. between-patient similarity (ETA-BAL)", "Permutation test (999 permutations)", "N/A (single test per timepoint)", "1 per timepoint (2 total)", "",
+  "Beta diversity, within-patient temporal stability", "Permutation test (999 permutations)", "N/A (single test per tissue)", "1 per tissue (3 total)", ""
 )
 
 kable(stats_summary, caption = "Statistical tests and multiple-comparison corrections used across analyses")
 write.csv(stats_summary, file.path(output_dir, "Table_Statistical_Methods_Summary.csv"), row.names = FALSE)
 
 ```
-
----
 
 ## 13. Session Info
 

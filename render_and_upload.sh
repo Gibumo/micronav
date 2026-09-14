@@ -1,59 +1,54 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# Variables esperadas (se pasan con -e en el docker run):
-#   S3_DATA_BUCKET   bucket donde están los 3 archivos de entrada (.shared, .taxonomy, .xlsx)
-#   S3_DATA_PREFIX   carpeta dentro de ese bucket, ej. microvap/input
-#   S3_BUCKET        bucket donde subir los resultados
-#   S3_PREFIX        carpeta dentro del bucket de resultados, ej. microvap/2026-09-08
-#   OUTPUT_FORMAT    "html_document" (default) o "pdf_document"
-#   AUTO_SHUTDOWN    "true" para apagar la instancia EC2 al terminar (default: false)
-#
-# Autenticación con S3: NO se pasan llaves aquí. Si el EC2 tiene un IAM role
-# con permisos sobre los buckets, aws-cli las toma automáticamente. Si estás
-# probando localmente (no en EC2), exporta AWS_ACCESS_KEY_ID /
-# AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION antes del docker run.
+# ============================================================
+# AVISO: no tenía acceso a tu render_and_upload.sh original --
+# lo reconstruí a partir de lo que se alcanza a inferir del log
+# de una corrida anterior (los mensajes "=== ... ===" y el
+# patrón "upload: ..." de `aws s3 sync`). Revísalo con cuidado
+# antes de confiar en él, sobre todo si el original tenía pasos
+# adicionales que no aparecían en las 40 líneas de log que
+# compartiste.
+# ============================================================
 
-OUTPUT_FORMAT="${OUTPUT_FORMAT:-html_document}"
-export DATA_DIR="${DATA_DIR:-/analysis/data}"
-export OUTPUT_DIR="${OUTPUT_DIR:-/analysis/output}"
+: "${S3_BUCKET:?Falta S3_BUCKET en tu .env}"
+AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-false}"
+RMD_FILE="comparison_samples_09092026.Rmd"
+OUTPUT_DIR="${OUTPUT_DIR:-/analysis/output}"
 
-mkdir -p "$DATA_DIR" "$OUTPUT_DIR"
+# Fecha calculada AQUÍ, en tiempo de ejecución -- no en el build de la imagen.
+# Esto es lo que corrige la carpeta de fecha vieja (2026-09-08) que viste en
+# el log, que quedaba fija porque venía de una imagen construida antes.
+RUN_DATE="$(date -u +%Y-%m-%d)"
 
-if [ -n "${S3_DATA_BUCKET:-}" ]; then
-  SRC="s3://${S3_DATA_BUCKET}/${S3_DATA_PREFIX:-}"
-  echo "=== Descargando datos de entrada desde $SRC ==="
-  aws s3 sync "$SRC" "$DATA_DIR"
-  echo "=== Datos descargados: ==="
-  ls -la "$DATA_DIR"
-else
-  echo "AVISO: S3_DATA_BUCKET no está definido, se usará lo que ya haya en $DATA_DIR"
-fi
+mkdir -p "$OUTPUT_DIR"
 
-echo "=== Iniciando render: $(date) ==="
-echo "Formato de salida: $OUTPUT_FORMAT"
+echo "=== Iniciando render: $(date -u) ==="
+Rscript -e "rmarkdown::render('${RMD_FILE}', output_file = 'analysis.html', output_dir = '${OUTPUT_DIR}')"
+echo "=== Render terminado: $(date -u) ==="
 
-Rscript -e "rmarkdown::render('analysis.Rmd', output_format = '${OUTPUT_FORMAT}', output_dir = '.')"
+echo "=== Subiendo resultados a s3://${S3_BUCKET}/output/${RUN_DATE}/ ==="
+aws s3 sync "$OUTPUT_DIR" "s3://${S3_BUCKET}/output/${RUN_DATE}/"
+echo "=== Subida completa ==="
 
-echo "=== Render terminado: $(date) ==="
-
-if [ -n "${S3_BUCKET:-}" ]; then
-  DEST="s3://${S3_BUCKET}/${S3_PREFIX:-resultados}/"
-  echo "=== Subiendo resultados a $DEST ==="
-
-  # Carpeta de figuras/tablas (output_dir dentro del .Rmd)
-  aws s3 cp "$OUTPUT_DIR" "$DEST" --recursive
-
-  # El documento knitteado (html o pdf) queda en /analysis
-  aws s3 cp . "$DEST" --recursive --exclude "*" --include "analysis.html" --include "analysis.pdf"
-
-  echo "=== Subida completa ==="
-else
-  echo "AVISO: S3_BUCKET no está definido, no se subió nada. Resultados quedan en el contenedor."
-fi
-
-if [ "${AUTO_SHUTDOWN:-false}" = "true" ]; then
+if [ "$AUTO_SHUTDOWN" = "true" ]; then
   echo "=== AUTO_SHUTDOWN=true: apagando la instancia EC2 en 60s ==="
   sleep 60
-  sudo shutdown -h now
+
+  # 'sudo shutdown' (lo que veías fallar como "command not found") no
+  # funciona desde DENTRO del contenedor: no tiene sudo instalado y, aunque
+  # lo tuviera, un contenedor no controla el apagado del host EC2. Para
+  # apagar la instancia real hay que llamar la API de EC2 desde aquí, y para
+  # eso la instancia necesita un IAM Instance Role con permiso
+  # ec2:StopInstances (Consola AWS > EC2 > tu instancia > Actions > Security
+  # > Modify IAM role).
+  INSTANCE_ID="$(curl -sf http://169.254.169.254/latest/meta-data/instance-id || true)"
+  REGION="$(curl -sf http://169.254.169.254/latest/meta-data/placement/region || true)"
+
+  if [ -n "$INSTANCE_ID" ] && [ -n "$REGION" ]; then
+    echo "Apagando instancia ${INSTANCE_ID} en ${REGION}..."
+    aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
+  else
+    echo "No se pudo leer instance-id/region desde el metadata endpoint; no se apagó la instancia."
+  fi
 fi

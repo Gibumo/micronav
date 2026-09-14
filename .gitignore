@@ -1,11 +1,18 @@
-﻿.env
+# Credenciales -- NUNCA debe ir a GitHub, ni en repo privado
+.env
+
+# Resultados de las corridas (pesados, regenerables, no son código)
 output/
+
+# Archivos de datos (ajusta los nombres a tus 3 archivos reales si difieren)
+*.csv.gz
 data/
-*.html
-*.pdf
-*_cache/
-*_files/
+
+# Temporales de R
+*.RData
+*.Rhistory
+*.Rproj.user/
 .Rproj.user/
-.Rhistory
-.RData
-.Ruserdata
+
+# Logs
+*.log
