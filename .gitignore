@@ -3,16 +3,20 @@
 
 # Resultados de las corridas (pesados, regenerables, no son código)
 output/
+*.html
+*.pdf
 
-# Archivos de datos (ajusta los nombres a tus 3 archivos reales si difieren)
-*.csv.gz
+# Archivos de datos (ajusta los nombres si tus 3 archivos reales difieren)
 data/
+*.csv.gz
 
-# Temporales de R
+# Temporales y auxiliares de R / R Markdown
 *.RData
 *.Rhistory
-*.Rproj.user/
+*.Ruserdata
 .Rproj.user/
+*_cache/
+*_files/
 
 # Logs
 *.log
