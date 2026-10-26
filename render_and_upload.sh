@@ -61,7 +61,9 @@ if [ -n "${S3_BUCKET:-}" ]; then
   aws s3 cp "$OUTPUT_DIR" "$DEST" --recursive
 
   # El documento knitteado (html o pdf) queda en /analysis
-  aws s3 cp . "$DEST" --recursive --exclude "*" --include "analysis.html" --include "analysis.pdf"
+  # (corregido: antes buscaba "analysis.html", que ya no existe, y el HTML no se subía)
+  REPORT_BASE="${RMD_FILE%.Rmd}"
+  aws s3 cp . "$DEST" --recursive --exclude "*" --include "${REPORT_BASE}.html" --include "${REPORT_BASE}.pdf"
 
   echo "=== Subida completa ==="
 fi

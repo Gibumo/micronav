@@ -50,7 +50,7 @@ rm(list = ls(all = TRUE))
 # volume) so results land somewhere the host / S3 upload step can reach.
 output_dir <- Sys.getenv(
   "OUTPUT_DIR",
-  "C:/Users/ingridbumo/OneDrive - Universidad de la Sabana/Escritorio/Documentos Organizados/TSID-CCM/RStudio Estadistica/Comparison samples/figures_comparison_samples_final"
+  "C:/Users/ingridbumo/OneDrive - Universidad de la Sabana/Escritorio/Documentos Organizados/TSID-CCM/RStudio Estadistica/Comparison samples/analisis_final_octubre_2026"
 )
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -540,152 +540,110 @@ cat("BAL temporal stability:\n"); print(test_temporal_stability("BAL"))
 
 ```
 
-### 6.5 Figure 2 — Beta Diversity (5-panel: cross-sectional + longitudinal)
+### 6.5 Manuscript Figure 1 — Beta Diversity (revised, round 2)
 
-```{r figure2_helper}
+Revised in response to Reviewer 1 (round 2): marginal PCoA boxplots removed so the
+ordination panels can be enlarged; figure built at final print size (7.2 in wide)
+with legible fonts; exact PERMANOVA R² and p-values reported on each panel; all
+panels share the same axis limits (wide enough to show complete ellipses) so they can be compared directly.
+Saved as TIFF (600 dpi), PDF (vector) and PNG (preview).
 
-format_p_beta <- function(adonis_result) {
-  p <- adonis_result$`Pr(>F)`[1]
-  if (p < 0.01) "p < 0.01" else if (p < 0.05) "p < 0.05" else "p > 0.05"
+```{r figure1_beta_revised, fig.width=7.2, fig.height=6.6}
+
+# PERMANOVA label: R² and p (p < 0.001 when at the permutation floor)
+fmt_perm <- function(res) {
+  r2 <- res$R2[1]
+  p  <- res$`Pr(>F)`[1]
+  p_txt <- if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+  sprintf("PERMANOVA R\u00b2 = %.3f, %s", r2, p_txt)
 }
 
-# Combines a box+PCoA+box panel with a bordered label row (panel title + p-value).
-# main_plot is wrapped with wrap_elements() before combining with the label row,
-# and the combined result is wrapped again before the border theme is applied,
-# so patchwork treats each panel as a single atomic unit (needed for correct
-# tag_levels="A" labeling and to avoid the border being drawn twice).
-add_label_and_border <- function(main_plot, panel_title, p_label) {
-  label_row <- ggplot() +
-    annotate("text", x = 0, y = 0.75, label = panel_title, fontface = "bold", size = 5.5, hjust = 0) +
-    annotate("text", x = 0, y = 0.2,  label = p_label, size = 4, hjust = 0) +
-    xlim(0, 1) + ylim(0, 1.3) +
-    theme_void()
+ax_x <- sprintf("PCoA1 (%.1f%%)", percent_explained[1])
+ax_y <- sprintf("PCoA2 (%.1f%%)", percent_explained[2])
 
-  combined <- (wrap_elements(main_plot) / label_row) + plot_layout(heights = c(4, 0.6))
-  outer <- wrap_elements(combined)
-  outer + theme(plot.background = element_rect(color = "black", fill = NA, linewidth = 1.1),
-                plot.margin = ggplot2::margin(4, 4, 4, 4))
-}
+theme_fig1 <- theme_bw(base_size = 9) +
+  theme(panel.grid.minor  = element_blank(),
+        plot.title        = element_text(face = "bold", size = 10, hjust = 0.5),
+        plot.subtitle     = element_text(size = 8, hjust = 0.5),
+        legend.position   = "bottom",
+        legend.title      = element_blank(),
+        legend.text       = element_text(size = 8),
+        legend.margin     = ggplot2::margin(0, 0, 0, 0),
+        legend.box.spacing = unit(2, "pt"))
 
-```
-
-```{r figure2_panelAB_by_tissue, fig.width=9, fig.height=6}
-
-build_panel_by_tissue <- function(timepoint_filter, panel_title, permanova_result) {
+# Panels A-B: NP vs ETA vs BAL within each timepoint
+panel_site <- function(tp, title, res) {
   df <- pcoa_df_all %>%
-    filter(Timepoint == timepoint_filter) %>%
+    filter(Timepoint == tp) %>%
     mutate(TissueType = factor(TissueType, levels = c("NP", "ETA", "BAL")))
-
-  gg_pcoa <- ggplot(df, aes(x = PCoA1, y = PCoA2)) +
-    geom_point(aes(color = TissueType, shape = TissueType), size = 1) +
-    stat_ellipse(aes(color = TissueType, fill = TissueType), geom = "polygon",
-                 alpha = 0.1, level = 0.95, linewidth = 0.8) +
+  ggplot(df, aes(PCoA1, PCoA2, color = TissueType, fill = TissueType, shape = TissueType)) +
+    stat_ellipse(geom = "polygon", alpha = 0.10, level = 0.95, linewidth = 0.6) +
+    geom_point(size = 1, alpha = 0.8) +
     scale_color_manual(values = tissue_colors) +
-    scale_fill_manual(values = tissue_colors, guide = "none") +
+    scale_fill_manual(values = tissue_colors) +
     scale_shape_manual(values = c("NP" = 16, "ETA" = 17, "BAL" = 15)) +
-    theme_minimal() +
-    labs(x = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)"),
-         y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)"),
-         color = "Tissue Type", shape = "Tissue Type") +
-    theme(legend.position = "right", plot.margin = ggplot2::margin(b = 12, r = 4))
-
-  pc1_box <- ggplot(df, aes(x = TissueType, y = PCoA1, fill = TissueType)) +
-    geom_boxplot(outlier.shape = 19, alpha = 0.6) +
-    scale_fill_manual(values = tissue_colors) +
-    theme_minimal() +
-    labs(x = NULL, y = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)")) +
-    theme(legend.position = "none", plot.margin = ggplot2::margin(t = 12, r = 4))
-
-  pc2_box <- ggplot(df, aes(x = TissueType, y = PCoA2, fill = TissueType)) +
-    geom_boxplot(outlier.shape = 19, alpha = 0.6) +
-    scale_fill_manual(values = tissue_colors) +
-    theme_minimal() +
-    labs(x = NULL, y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)")) +
-    theme(legend.position = "none")
-
-  main <- (pc2_box + gg_pcoa) / (plot_spacer() + pc1_box) + plot_layout(heights = c(2, 1))
-  add_label_and_border(main, panel_title, format_p_beta(permanova_result))
+    labs(title = title, subtitle = fmt_perm(res), x = ax_x, y = ax_y) +
+    theme_fig1
 }
 
-panel_A <- build_panel_by_tissue("baseline",   "Baseline",   permanova_baseline)
-panel_B <- build_panel_by_tissue("follow_dos", "Follow-up",  permanova_follow)
-
-print(panel_A)
-print(panel_B)
-
-```
-
-```{r figure2_panelCDE_longitudinal, fig.width=9, fig.height=6}
-
-build_panel_longitudinal <- function(site, follow_color, panel_title, permanova_result) {
+# Panels C-E: baseline vs follow-up within each site
+panel_time <- function(site, follow_color, res) {
   df <- pcoa_df_all %>%
     filter(TissueType == site) %>%
-    mutate(Timepoint_label = case_when(
-      Timepoint == "baseline"   ~ "Baseline",
-      Timepoint == "follow_dos" ~ "Follow-up"
-    ),
-    Timepoint_label = factor(Timepoint_label, levels = c("Baseline", "Follow-up")))
-
-  cols <- c("Baseline" = "goldenrod2", "Follow-up" = follow_color)
-
-  gg_pcoa <- ggplot(df, aes(x = PCoA1, y = PCoA2, color = Timepoint_label, shape = Timepoint_label)) +
-    stat_ellipse(aes(fill = Timepoint_label), geom = "polygon", alpha = 0.2, level = 0.95, linewidth = 1) +
-    geom_point(size = 2) +
+    mutate(Timepoint_label = factor(ifelse(Timepoint == "baseline", "Baseline", "72 h"),
+                                    levels = c("Baseline", "72 h")))
+  cols <- c("Baseline" = "goldenrod2", "72 h" = follow_color)
+  ggplot(df, aes(PCoA1, PCoA2, color = Timepoint_label, fill = Timepoint_label,
+                 shape = Timepoint_label)) +
+    stat_ellipse(geom = "polygon", alpha = 0.15, level = 0.95, linewidth = 0.6) +
+    geom_point(size = 1, alpha = 0.8) +
     scale_color_manual(values = cols) +
-    scale_fill_manual(values = cols, guide = "none") +
-    scale_shape_manual(values = c("Baseline" = 16, "Follow-up" = 17)) +
-    theme_minimal() +
-    labs(x = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)"),
-         y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)"),
-         color = "Timepoint", shape = "Timepoint") +
-    theme(legend.position = "right", plot.margin = ggplot2::margin(b = 12, r = 4))
-
-  pc1_box <- ggplot(df, aes(x = Timepoint_label, y = PCoA1, fill = Timepoint_label)) +
-    geom_boxplot(outlier.shape = 21, alpha = 0.7) +
     scale_fill_manual(values = cols) +
-    theme_minimal() +
-    labs(x = NULL, y = paste0("PCoA1 (", round(percent_explained[1], 2), "% Explained)")) +
-    theme(legend.position = "none", plot.margin = ggplot2::margin(t = 12, r = 4))
-
-  pc2_box <- ggplot(df, aes(x = Timepoint_label, y = PCoA2, fill = Timepoint_label)) +
-    geom_boxplot(outlier.shape = 21, alpha = 0.7) +
-    scale_fill_manual(values = cols) +
-    theme_minimal() +
-    labs(x = NULL, y = paste0("PCoA2 (", round(percent_explained[2], 2), "% Explained)")) +
-    theme(legend.position = "none")
-
-  main <- (pc2_box + gg_pcoa) / (plot_spacer() + pc1_box) + plot_layout(heights = c(2, 1))
-  add_label_and_border(main, panel_title, format_p_beta(permanova_result))
+    scale_shape_manual(values = c("Baseline" = 16, "72 h" = 17)) +
+    labs(title = site, subtitle = fmt_perm(res), x = ax_x, y = ax_y) +
+    theme_fig1
 }
 
-panel_C <- build_panel_longitudinal("NP",  "indianred3", "NP",  perm_np)
-panel_D <- build_panel_longitudinal("ETA", "cyan3",      "ETA", perm_eta)
-panel_E <- build_panel_longitudinal("BAL", "plum3",      "BAL", perm_bal)
+pA <- panel_site("baseline",   "Baseline", permanova_baseline)
+pB <- panel_site("follow_dos", "72 h",     permanova_follow)
+pC <- panel_time("NP",  tissue_colors[["NP"]],  perm_np)
+pD <- panel_time("ETA", tissue_colors[["ETA"]], perm_eta)
+pE <- panel_time("BAL", tissue_colors[["BAL"]], perm_bal)
 
-print(panel_C)
-print(panel_D)
-print(panel_E)
+# Common axis limits for all five panels, wide enough to include full ellipses
+rng <- do.call(rbind, lapply(list(pA, pB, pC, pD, pE), function(p) {
+  d <- do.call(rbind, lapply(ggplot_build(p)$data, function(z) z[, c("x", "y")]))
+  data.frame(x = range(d$x), y = range(d$y))
+}))
+lims <- coord_cartesian(xlim = range(rng$x), ylim = range(rng$y))
+pA <- pA + lims; pB <- pB + lims; pC <- pC + lims; pD <- pD + lims; pE <- pE + lims
 
-```
+fig1_top    <- (pA + pB + plot_layout(guides = "collect")) & theme(legend.position = "bottom")
+fig1_bottom <- pC + pD + pE
 
-```{r figure2_combined, fig.width=22, fig.height=11}
-
-fig2_top    <- panel_A | panel_B
-fig2_bottom <- panel_C | panel_D | panel_E
-
-fig2_final <- fig2_top / fig2_bottom +
-  plot_layout(heights = c(1.2, 1)) +
+fig1_final <- (fig1_top / fig1_bottom) +
+  plot_layout(heights = c(1.15, 1)) +
   plot_annotation(tag_levels = "A") &
-  theme(plot.tag = element_text(size = 22, face = "bold"),
-        plot.tag.position = c(0, 1),
-        plot.margin = ggplot2::margin(t = 18, r = 10, b = 8, l = 10))
+  theme(plot.tag = element_text(size = 11, face = "bold"))
 
-print(fig2_final)
+print(fig1_final)
 
-ggsave(file.path(output_dir, "Figure2_BetaDiversity_Combined.tiff"), plot = fig2_final,
-       width = 22, height = 11, dpi = 600, compression = "lzw")
+ggsave(file.path(output_dir, "Figure1_BetaDiversity_revised.tiff"), plot = fig1_final,
+       width = 7.2, height = 6.6, units = "in", dpi = 600, compression = "lzw")
+ggsave(file.path(output_dir, "Figure1_BetaDiversity_revised.pdf"), plot = fig1_final,
+       width = 7.2, height = 6.6, units = "in", device = cairo_pdf)
+ggsave(file.path(output_dir, "Figure1_BetaDiversity_revised.png"), plot = fig1_final,
+       width = 7.2, height = 6.6, units = "in", dpi = 300)
+
+# Values printed on the panels (for checking against the manuscript text)
+data.frame(
+  Panel = c("A Baseline", "B 72 h", "C NP", "D ETA", "E BAL"),
+  R2    = sapply(list(permanova_baseline, permanova_follow, perm_np, perm_eta, perm_bal), function(r) r$R2[1]),
+  p     = sapply(list(permanova_baseline, permanova_follow, perm_np, perm_eta, perm_bal), function(r) r$`Pr(>F)`[1])
+)
 
 ```
+
 
 ## 7. Alpha Diversity — Shannon Index, Richness, and Evenness
 
